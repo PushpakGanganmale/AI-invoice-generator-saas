@@ -291,7 +291,7 @@ export default function InvoicePreview() {
       const remainingAmount = data.remainingAmount; // ✅ correct remaining from backend
 
       const options = {
-        key: "rzp_live_SPnxCBbAompnt1",
+        key: "rzp_live_TwlllXkEzAbjvY",
         amount: order.amount,
         currency: "INR",
         name: "Invoice Genius",
