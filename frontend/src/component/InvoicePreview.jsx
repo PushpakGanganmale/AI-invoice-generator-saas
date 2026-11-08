@@ -289,7 +289,7 @@ export default function InvoicePreview() {
       }
 
       const order = data.order;
-      const remainingAmount = data.remainingAmount; // ✅ correct remaining from backend
+      const remainingAmount = data.remainingAmount;
 
       const options = {
         key: import.meta.env.VITE_RAZORPAY_KEY_ID,
@@ -300,28 +300,30 @@ export default function InvoicePreview() {
         order_id: order.id,
 
         handler: async function (response) {
-          await fetch(`${API_BASE}/api/payment/update-payment`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${token}`,
-            },
-            body: JSON.stringify({
-              invoiceId: invoice._id || invoice.id,
-              amount: remainingAmount, // ✅ correct amount
-            }),
-          });
+          try {
+            const upRes = await fetch(`${API_BASE}/api/payment/update-payment`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify({
+                invoiceId: invoice._id || invoice.id,
+                amount: remainingAmount,
+                // sent so the backend can verify the payment signature
+                razorpay_order_id: response.razorpay_order_id,
+                razorpay_payment_id: response.razorpay_payment_id,
+                razorpay_signature: response.razorpay_signature,
+              }),
+            });
+            if (!upRes.ok) throw new Error("update-payment failed");
 
-          // ✅ fetch fresh invoice after payment
-          const freshRes = await fetch(INVOICE_ENDPOINT(invoice._id || invoice.id), {
-            headers: { Authorization: `Bearer ${token}` },
-          });
-          const freshData = await freshRes.json();
-          if (freshData?.data) {
-            setInvoice({ ...freshData.data, id: freshData.data._id });
+            alert("Payment Successful!");
+            navigate("/app/invoices");
+          } catch (err) {
+            console.error(err);
+            alert("Payment received, but updating the invoice failed. Please refresh.");
           }
-
-          alert("Payment Successful!");
         },
 
         prefill: {
@@ -335,7 +337,6 @@ export default function InvoicePreview() {
 
       const razor = new window.Razorpay(options);
       razor.open();
-
     } catch (err) {
       console.error(err);
       alert("Payment failed");

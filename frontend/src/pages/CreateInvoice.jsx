@@ -53,10 +53,18 @@ function currencyFmt(amount = 0, currency = "INR") {
   } catch { return `${currency} ${amount}`; }
 }
 
-function computeTotals(items = [], taxPercent = 0) {
+// One place that decides the tax rate, so saving, previewing and the on-screen
+// summary can never disagree. Empty / missing => 18% default; an explicit 0 stays 0.
+function resolveTaxPercent(value) {
+  if (value === "" || value === null || value === undefined) return 18;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 18;
+}
+
+function computeTotals(items = [], taxPercent) {
   const safe = Array.isArray(items) ? items.filter(Boolean) : [];
   const subtotal = safe.reduce((s, it) => s + Number(it.qty || 0) * Number(it.unitPrice || 0), 0);
-  const tax = (subtotal * Number(taxPercent || 0)) / 100;
+  const tax = (subtotal * resolveTaxPercent(taxPercent)) / 100;
   return { subtotal, tax, total: subtotal + tax };
 }
 
@@ -301,7 +309,7 @@ export default function CreateInvoice() {
       currency: invoice.currency || "INR",
       status: invoice.status || "draft",
 
-      taxPercent: Number(invoice.taxPercent ?? 18),
+      taxPercent: resolveTaxPercent(invoice.taxPercent),
 
       subtotal: totals.subtotal,
       tax: totals.tax,
@@ -364,17 +372,19 @@ export default function CreateInvoice() {
 }
 
   function handlePreview() {
+    const previewTotals = computeTotals(items, invoice.taxPercent);
     const prepared = {
       ...invoice,
       items,
-      subtotal: computeTotals(items, invoice.taxPercent).subtotal,
-      tax: computeTotals(items, invoice.taxPercent).tax,
-      total: computeTotals(items, invoice.taxPercent).total,
+      taxPercent: resolveTaxPercent(invoice.taxPercent),
+      subtotal: previewTotals.subtotal,
+      tax: previewTotals.tax,
+      total: previewTotals.total,
     };
     navigate(`/app/invoices/${invoice.id}/preview`, { state: { invoice: prepared } });
   }
 
-  const totals = computeTotals(items, invoice?.taxPercent ?? 18);
+  const totals = computeTotals(items, invoice?.taxPercent);
 
   return (
     <div className={createInvoiceStyles.pageContainer}>
