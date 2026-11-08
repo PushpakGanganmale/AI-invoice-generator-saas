@@ -38,8 +38,6 @@ function getRazorpay() {
 
 const round2 = (n) => Number(Number(n || 0).toFixed(2));
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 function getUserId(req) {
   try {
     const auth = getAuth(req);
@@ -69,16 +67,29 @@ function computeTotals(items = [], taxPercent = 0) {
   };
 }
 
-// Razorpay can briefly report "authorized" before auto-capture completes.
-async function fetchSettledPayment(rzp, paymentId) {
-  let payment = null;
+// Returns the payment in its most settled state.
+// If Razorpay still reports "authorized" (auto-capture lagging or switched
+// off in the dashboard), capture it here. The signature, order ownership
+// and amount have already been verified by the caller, so this is safe.
+// No sleeping/polling: serverless functions have short time limits.
+async function settlePayment(rzp, paymentId, order) {
+  let payment = await rzp.payments.fetch(paymentId);
 
-  for (let attempt = 0; attempt < 4; attempt++) {
-    payment = await rzp.payments.fetch(paymentId);
-
-    if (payment.status !== "authorized") return payment;
-
-    await sleep(1500);
+  if (payment.status === "authorized") {
+    try {
+      payment = await rzp.payments.capture(
+        paymentId,
+        Number(order.amount),
+        order.currency || "INR"
+      );
+    } catch (error) {
+      // Auto-capture may have won the race - re-read the real state.
+      console.warn(
+        `Capture attempt for ${paymentId} failed:`,
+        error?.error?.description || error?.message
+      );
+      payment = await rzp.payments.fetch(paymentId);
+    }
   }
 
   return payment;
@@ -359,7 +370,7 @@ export const updatePayment = async (req, res) => {
 
     /* 5. Verify payment status and amount directly with Razorpay. */
 
-    const payment = await fetchSettledPayment(rzp, paymentId);
+    const payment = await settlePayment(rzp, paymentId, order);
 
     if (payment.order_id !== orderId) {
       return res.status(400).json({
@@ -379,7 +390,7 @@ export const updatePayment = async (req, res) => {
       return res.status(409).json({
         success: false,
         message:
-          "Payment is still being processed. Please refresh in a minute.",
+          "Payment is still being processed. It will be reflected on the invoice shortly.",
       });
     }
 

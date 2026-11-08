@@ -691,6 +691,54 @@ export default function InvoicePreview() {
         );
       }
 
+      /* -------- POST-PAYMENT HELPERS -------- */
+
+      const paidBefore = round2(Number(invoice.paidAmount || 0));
+
+      const showSuccess = (freshInvoice) => {
+        const freshRemaining = Math.max(
+          round2(
+            Number(freshInvoice.total || 0) -
+              Number(freshInvoice.paidAmount || 0)
+          ),
+          0
+        );
+
+        alert(
+          `Payment successful!\n\nPaid: ${currencyFmt(
+            freshInvoice.paidAmount,
+            freshInvoice.currency
+          )}\nRemaining: ${currencyFmt(
+            freshRemaining,
+            freshInvoice.currency
+          )}\nStatus: ${freshInvoice.status}`
+        );
+      };
+
+      // The money may already be recorded (e.g. by the Razorpay webhook)
+      // even if the verify call failed or timed out. Poll the database
+      // for up to ~30s before telling the user anything went wrong.
+      const waitForRecordedPayment = async () => {
+        for (let attempt = 0; attempt < 8; attempt++) {
+          try {
+            const freshInvoice = await fetchInvoice(invoiceId);
+
+            if (
+              round2(Number(freshInvoice.paidAmount || 0)) >
+              paidBefore
+            ) {
+              return freshInvoice;
+            }
+          } catch (pollError) {
+            console.error("Payment poll error:", pollError);
+          }
+
+          await new Promise((resolve) => setTimeout(resolve, 4000));
+        }
+
+        return null;
+      };
+
       /* -------- CHECKOUT OPTIONS -------- */
 
       const options = {
@@ -742,44 +790,36 @@ export default function InvoicePreview() {
 
             setInvoice(freshInvoice);
 
-            const freshRemaining = Math.max(
-              round2(
-                Number(freshInvoice.total || 0) -
-                  Number(freshInvoice.paidAmount || 0)
-              ),
-              0
-            );
-
-            alert(
-              `Payment successful!\n\nPaid: ${currencyFmt(
-                freshInvoice.paidAmount,
-                freshInvoice.currency
-              )}\nRemaining: ${currencyFmt(
-                freshRemaining,
-                freshInvoice.currency
-              )}\nStatus: ${freshInvoice.status}`
-            );
+            showSuccess(freshInvoice);
           } catch (error) {
             console.error(
               "Payment verification error:",
               error
             );
 
-            alert(
-              `Payment verification/update issue: ${error.message}\n\nReference: ${
-                response?.razorpay_payment_id || "N/A"
-              }\n\nDo not pay again immediately. Check your Razorpay Dashboard and invoice payment status first.`
-            );
+            // Verification failed or timed out, but the payment may
+            // still have been recorded. Confirm before alarming anyone.
+            const recorded = await waitForRecordedPayment();
 
-            // Refresh anyway: the payment may have been recorded.
-            try {
-              const freshInvoice = await fetchInvoice(invoiceId);
-              setInvoice(freshInvoice);
-            } catch (refreshError) {
-              console.error(
-                "Invoice refresh error:",
-                refreshError
+            if (recorded) {
+              setInvoice(recorded);
+              showSuccess(recorded);
+            } else {
+              alert(
+                `Your payment was received by Razorpay but is still being confirmed.\n\nReference: ${
+                  response?.razorpay_payment_id || "N/A"
+                }\n\nDo NOT pay again. Refresh this page in a minute - the invoice will update automatically.`
               );
+
+              try {
+                const freshInvoice = await fetchInvoice(invoiceId);
+                setInvoice(freshInvoice);
+              } catch (refreshError) {
+                console.error(
+                  "Invoice refresh error:",
+                  refreshError
+                );
+              }
             }
           } finally {
             finish();
