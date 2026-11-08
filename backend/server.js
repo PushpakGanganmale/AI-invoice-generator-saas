@@ -10,6 +10,7 @@ import invoiceRouter from "./routes/invoiceRouter.js";
 import bussinessProfileRouter from "./routes/bussinessProfileRouter.js";
 import aiInvoiceRouter from "./routes/aiInvoiceRouter.js";
 import paymentRouter from "./routes/paymentRouter.js";
+import { razorpayWebhook } from "./controllers/webhookController.js";
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -45,6 +46,15 @@ app.use(
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "Accept"],
   })
+);
+
+/* ---------------- RAZORPAY WEBHOOK (raw body, no Clerk) ---------------- */
+// Must stay BEFORE express.json() so the signature is computed on the raw body.
+
+app.post(
+  "/api/payment/webhook",
+  express.raw({ type: "application/json", limit: "1mb" }),
+  razorpayWebhook
 );
 
 /* ---------------- BODY PARSING ---------------- */
