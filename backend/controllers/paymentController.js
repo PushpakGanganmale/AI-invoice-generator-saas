@@ -1,9 +1,19 @@
+
+import crypto from "crypto";
+import mongoose from "mongoose";
 import Razorpay from "razorpay";
 import Invoice from "../models/invoiceModel.js";
 
+const keyId = process.env.RAZORPAY_KEY_ID;
+const keySecret = process.env.RAZORPAY_KEY_SECRET;
+
+if (!keyId || !keySecret) {
+  console.error("Razorpay environment variables are missing.");
+}
+
 const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
+  key_id: keyId,
+  key_secret: keySecret,
 });
 
 /* ---------------- CREATE ORDER ---------------- */
@@ -11,139 +21,282 @@ const razorpay = new Razorpay({
 export const createOrder = async (req, res) => {
   try {
     const { invoiceId } = req.body;
+    const userId = req.auth?.userId;
 
-    if (!invoiceId) {
+    if (!userId || !invoiceId) {
       return res.status(400).json({
         success: false,
-        message: "Invoice ID is required",
+        message: "Authentication and invoice ID are required.",
       });
     }
 
-    const invoice = await Invoice.findById(invoiceId);
+    if (!mongoose.Types.ObjectId.isValid(invoiceId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid invoice ID.",
+      });
+    }
+
+    const invoice = await Invoice.findOne({
+      _id: invoiceId,
+      owner: userId,
+    });
 
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: "Invoice not found",
+        message: "Invoice not found.",
       });
     }
 
-    /* -------- BLOCK IF ALREADY FULLY PAID -------- */
+    if (invoice.currency !== "INR") {
+      return res.status(400).json({
+        success: false,
+        message: "Only INR payments are supported by this payment gateway.",
+      });
+    }
 
     if (invoice.status === "paid") {
       return res.status(400).json({
         success: false,
-        message: "Invoice is already fully paid",
+        message: "Invoice is already fully paid.",
       });
     }
 
-    /* -------- ALWAYS RECALCULATE FRESH FROM ITEMS -------- */
-
+    // Calculate invoice total from saved invoice items.
     const subtotal = (invoice.items || []).reduce(
-      (sum, item) => sum + (Number(item.qty) || 0) * (Number(item.unitPrice) || 0),
+      (sum, item) =>
+        sum +
+        Number(item.qty || 0) * Number(item.unitPrice || 0),
       0
     );
 
-    const tax = (subtotal * (Number(invoice.taxPercent) || 0)) / 100;
+    const tax =
+      (subtotal * Number(invoice.taxPercent || 0)) / 100;
 
-    // ✅ FIXED: always recalculate fresh total from items
-    const freshTotal = Number((subtotal + tax).toFixed(2));
+    const total = Number((subtotal + tax).toFixed(2));
 
-    // ✅ FIXED: recalculate remaining from fresh total
-    const paidAmount = Number(invoice.paidAmount) || 0;
-    const remainingAmount = Number(Math.max(freshTotal - paidAmount, 0).toFixed(2));
+    const paidAmount = Number(invoice.paidAmount || 0);
 
-    const amount = remainingAmount > 0 ? remainingAmount : freshTotal;
+    const remainingAmount = Number(
+      Math.max(total - paidAmount, 0).toFixed(2)
+    );
 
-    if (!amount || amount <= 0) {
+    if (remainingAmount <= 0) {
       return res.status(400).json({
         success: false,
-        message: "Invalid payment amount",
+        message: "No remaining amount to pay.",
       });
     }
 
-    /* -------- SYNC INVOICE TOTAL IF CHANGED -------- */
+    // Save authoritative totals.
+    invoice.subtotal = Number(subtotal.toFixed(2));
+    invoice.tax = Number(tax.toFixed(2));
+    invoice.total = total;
+    invoice.remainingAmount = remainingAmount;
 
-    if (invoice.total !== freshTotal) {
-      invoice.total = freshTotal;
-      invoice.subtotal = Number(subtotal.toFixed(2));
-      invoice.tax = Number(tax.toFixed(2));
-      invoice.remainingAmount = remainingAmount;
-      await invoice.save();
+    await invoice.save();
+
+    // Razorpay accepts amounts in paise.
+    const amountInPaise = Math.round(remainingAmount * 100);
+
+    if (amountInPaise <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid payment amount.",
+      });
     }
 
-    /* -------- CREATE RAZORPAY ORDER -------- */
-
     const order = await razorpay.orders.create({
-      amount: Math.round(Number(amount) * 100),
+      amount: amountInPaise,
       currency: "INR",
-      receipt: `invoice_${invoice._id}`,
+      receipt: `inv_${invoice._id}`.slice(0, 40),
+      notes: {
+        invoiceId: String(invoice._id),
+        invoiceNumber: invoice.invoiceNumber,
+        owner: userId,
+      },
     });
 
-    res.json({
+    invoice.razorpayOrderId = order.id;
+
+    await invoice.save();
+
+    return res.status(200).json({
       success: true,
+      message: "Payment order created successfully.",
       order,
-      remainingAmount: amount, // ✅ send correct amount to frontend
+      remainingAmount,
     });
-
   } catch (error) {
     console.error("Create Order Error:", error);
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
-      message: "Payment initialization failed",
+      message: "Payment initialization failed.",
     });
   }
 };
 
-/* ---------------- UPDATE PAYMENT ---------------- */
+/* ---------------- VERIFY PAYMENT ---------------- */
 
 export const updatePayment = async (req, res) => {
   try {
-    const { invoiceId, amount } = req.body;
+    const {
+      invoiceId,
+      razorpay_payment_id,
+      razorpay_order_id,
+      razorpay_signature,
+    } = req.body;
 
-    if (!invoiceId || !amount) {
+    const userId = req.auth?.userId;
+
+    if (
+      !userId ||
+      !invoiceId ||
+      !razorpay_payment_id ||
+      !razorpay_order_id ||
+      !razorpay_signature
+    ) {
       return res.status(400).json({
         success: false,
-        message: "Invoice ID and amount required",
+        message: "Missing payment verification details.",
       });
     }
 
-    const invoice = await Invoice.findById(invoiceId);
+    if (!mongoose.Types.ObjectId.isValid(invoiceId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid invoice ID.",
+      });
+    }
+
+    const invoice = await Invoice.findOne({
+      _id: invoiceId,
+      owner: userId,
+    });
 
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: "Invoice not found",
+        message: "Invoice not found.",
       });
     }
 
-    /* -------- BLOCK IF ALREADY FULLY PAID -------- */
-
-    if (invoice.status === "paid") {
+    // Check that this is the order created for this invoice.
+    if (invoice.razorpayOrderId !== razorpay_order_id) {
       return res.status(400).json({
         success: false,
-        message: "Invoice is already fully paid",
+        message: "Invalid Razorpay order ID.",
       });
     }
 
-    /* -------- UPDATE PAID AMOUNT -------- */
+    // Verify signature.
+    const expectedSignature = crypto
+      .createHmac("sha256", keySecret)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest("hex");
 
-    // pre("save") hook will auto-calculate remainingAmount and status
-    invoice.paidAmount = (invoice.paidAmount || 0) + Number(amount);
+    const expectedBuffer = Buffer.from(expectedSignature);
+    const receivedBuffer = Buffer.from(razorpay_signature);
+
+    if (
+      expectedBuffer.length !== receivedBuffer.length ||
+      !crypto.timingSafeEqual(
+        expectedBuffer,
+        receivedBuffer
+      )
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Razorpay signature verification failed.",
+      });
+    }
+
+    // Prevent duplicate payment recording.
+    const recordedIds = invoice.razorpayPaymentIds || [];
+
+    if (recordedIds.includes(razorpay_payment_id)) {
+      return res.status(200).json({
+        success: true,
+        message: "Payment has already been recorded.",
+        invoice,
+      });
+    }
+
+    // Independently verify the payment with Razorpay.
+    const payment = await razorpay.payments.fetch(
+      razorpay_payment_id
+    );
+
+    if (
+      payment.order_id !== razorpay_order_id ||
+      payment.status !== "captured" ||
+      payment.currency !== "INR"
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment has not been captured successfully.",
+      });
+    }
+
+    const paymentAmount = Number(payment.amount) / 100;
+
+    const expectedAmount = Number(
+      invoice.remainingAmount || 0
+    );
+
+    if (
+      !Number.isFinite(paymentAmount) ||
+      paymentAmount <= 0 ||
+      Math.abs(paymentAmount - expectedAmount) > 0.001
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment amount does not match the invoice balance.",
+      });
+    }
+
+    // Recheck duplicate IDs before saving.
+    if (
+      (invoice.razorpayPaymentIds || []).includes(
+        razorpay_payment_id
+      )
+    ) {
+      return res.status(200).json({
+        success: true,
+        message: "Payment has already been recorded.",
+        invoice,
+      });
+    }
+
+    // Update invoice.
+    invoice.paidAmount = Number(
+      (
+        Number(invoice.paidAmount || 0) +
+        paymentAmount
+      ).toFixed(2)
+    );
+
+    invoice.razorpayPaymentIds.push(razorpay_payment_id);
+
+    // Retain the latest payment details for reference.
+    invoice.razorpayPaymentId = razorpay_payment_id;
+    invoice.razorpaySignature = razorpay_signature;
+
     await invoice.save();
 
-    res.json({
+    return res.status(200).json({
       success: true,
+      message: "Payment verified and invoice updated successfully.",
       invoice,
     });
-
   } catch (error) {
-    console.error("Payment Update Error:", error);
+    console.error("Payment Verification Error:", error);
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
-      message: "Payment update failed",
+      message: "Payment verification failed.",
     });
   }
 };

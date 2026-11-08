@@ -69,7 +69,6 @@ app.get("/", (req, res) => {
 
 /* ---------------- DATABASE CONNECTION ---------------- */
 
-// Connect before executing any API route.
 app.use("/api", async (req, res, next) => {
   try {
     await connectDB();
@@ -97,7 +96,11 @@ app.get("/api/health", (req, res) => {
 
 /* ---------------- API ROUTES ---------------- */
 
-app.use("/api/invoices", requireAuth(), invoiceRouter);
+app.use(
+  "/api/invoices",
+  requireAuth(),
+  invoiceRouter
+);
 
 app.use(
   "/api/business-profile",
@@ -105,9 +108,17 @@ app.use(
   bussinessProfileRouter
 );
 
-app.use("/api/ai-invoices", requireAuth(), aiInvoiceRouter);
+app.use(
+  "/api/ai-invoices",
+  requireAuth(),
+  aiInvoiceRouter
+);
 
-app.use("/api/payment", requireAuth(), paymentRouter);
+app.use(
+  "/api/payment",
+  requireAuth(),
+  paymentRouter
+);
 
 /* ---------------- 404 ---------------- */
 
@@ -141,7 +152,9 @@ if (process.env.VERCEL !== "1") {
       await connectDB();
 
       app.listen(port, () => {
-        console.log(`InvoiceGenius running on port ${port}`);
+        console.log(
+          `InvoiceGenius running on port ${port}`
+        );
       });
     } catch (error) {
       console.error("Server startup failed:", error);

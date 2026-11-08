@@ -1,88 +1,127 @@
+
 import mongoose from "mongoose";
-import Razorpay from "razorpay";
 import Invoice from "../models/invoiceModel.js";
 
-/* ---------------- RAZORPAY INSTANCE ---------------- */
-
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET
-});
-
-/* ---------------- HELPER ---------------- */
+/* ---------------- HELPERS ---------------- */
 
 function computeTotals(items = [], taxPercent = 0) {
   const subtotal = items.reduce(
-    (s, it) => s + (Number(it.qty) || 0) * (Number(it.unitPrice) || 0),
+    (sum, item) =>
+      sum +
+      (Number(item.qty) || 0) *
+        (Number(item.unitPrice) || 0),
     0
   );
 
-  const tax = (subtotal * Number(taxPercent)) / 100;
+  const tax =
+    (subtotal * Number(taxPercent || 0)) / 100;
 
   return {
     subtotal: Number(subtotal.toFixed(2)),
     tax: Number(tax.toFixed(2)),
-    total: Number((subtotal + tax).toFixed(2))
+    total: Number((subtotal + tax).toFixed(2)),
   };
 }
 
 function generateInvoiceNumber() {
-  const ts = Date.now().toString(36).toUpperCase();
-  const rand = Math.random().toString(36).substring(2, 6).toUpperCase();
-  return `INV-${ts}-${rand}`;
+  const timestamp = Date.now().toString(36).toUpperCase();
+  const random = Math.random()
+    .toString(36)
+    .substring(2, 6)
+    .toUpperCase();
+
+  return `INV-${timestamp}-${random}`;
+}
+
+function invoiceQuery(id, userId) {
+  if (mongoose.Types.ObjectId.isValid(id)) {
+    return {
+      owner: userId,
+      $or: [
+        { _id: id },
+        { invoiceNumber: id },
+      ],
+    };
+  }
+
+  return {
+    owner: userId,
+    invoiceNumber: id,
+  };
 }
 
 /* ---------------- CREATE INVOICE ---------------- */
 
 export async function createInvoice(req, res) {
   try {
-
-    const auth = req.auth;
-    const userId = auth?.userId;
+    const userId = req.auth?.userId;
 
     if (!userId) {
       return res.status(401).json({
         success: false,
-        message: "User not authenticated"
+        message: "User not authenticated.",
       });
     }
 
-    const body = req.body;
+    const body = { ...req.body };
 
-    const items = Array.isArray(body.items) ? body.items : [];
+    const items = Array.isArray(body.items)
+      ? body.items
+      : [];
 
-    const totals = computeTotals(items, body.taxPercent || 0);
+    const taxPercent = Number(body.taxPercent) || 0;
+
+    if (taxPercent < 0 || taxPercent > 100) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid tax percentage.",
+      });
+    }
+
+    const totals = computeTotals(items, taxPercent);
+
+    // Never accept payment or ownership values from frontend.
+    delete body.owner;
+    delete body.paidAmount;
+    delete body.remainingAmount;
+    delete body.razorpayOrderId;
+    delete body.razorpayPaymentId;
+    delete body.razorpayPaymentIds;
+    delete body.razorpaySignature;
 
     const invoiceData = {
       ...body,
       owner: userId,
       invoiceNumber:
-        (body.invoiceNumber && body.invoiceNumber.trim()) ||
-        generateInvoiceNumber(),
-      ...totals
+        typeof body.invoiceNumber === "string" &&
+        body.invoiceNumber.trim()
+          ? body.invoiceNumber.trim()
+          : generateInvoiceNumber(),
+      items,
+      taxPercent,
+      paidAmount: 0,
+      ...totals,
     };
 
     const invoice = await Invoice.create(invoiceData);
 
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
-      data: invoice
+      data: invoice,
     });
+  } catch (error) {
+    console.error("Create Invoice Error:", error);
 
-  } catch (err) {
-
-    console.error("Create Error:", err);
-
-    if (err.code === 11000) {
+    if (error.code === 11000) {
       return res.status(409).json({
         success: false,
-        message: "Duplicate invoice number"
+        message: "Duplicate invoice number.",
       });
     }
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
-      message: err.message
+      message: "Invoice creation failed.",
     });
   }
 }
@@ -91,25 +130,28 @@ export async function createInvoice(req, res) {
 
 export async function getInvoices(req, res) {
   try {
-
-    const auth = req.auth;
-    const userId = auth?.userId;
+    const userId = req.auth?.userId;
 
     if (!userId) {
       return res.status(401).json({
         success: false,
-        message: "Unauthorized"
+        message: "Unauthorized.",
       });
     }
 
     const { invoiceNumber } = req.query;
 
-    let query = { owner: userId };
+    const query = {
+      owner: userId,
+    };
 
     if (invoiceNumber) {
       query.invoiceNumber = {
-        $regex: invoiceNumber,
-        $options: "i"
+        $regex: String(invoiceNumber).replace(
+          /[.*+?^${}()|[\]\\]/g,
+          "\\$&"
+        ),
+        $options: "i",
       };
     }
 
@@ -117,19 +159,17 @@ export async function getInvoices(req, res) {
       .sort({ createdAt: -1 })
       .lean();
 
-    res.json({
+    return res.status(200).json({
       success: true,
       count: invoices.length,
-      data: invoices
+      data: invoices,
     });
+  } catch (error) {
+    console.error("Get Invoices Error:", error);
 
-  } catch (err) {
-
-    console.error("getInvoices error:", err);
-
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
-      message: "Server error"
+      message: "Unable to fetch invoices.",
     });
   }
 }
@@ -138,42 +178,36 @@ export async function getInvoices(req, res) {
 
 export async function getInvoiceById(req, res) {
   try {
+    const userId = req.auth?.userId;
 
-    const auth = req.auth;
-    const userId = auth?.userId;
-
-    const id = req.params.id;
-
-    let query = { owner: userId, invoiceNumber: id };
-
-    if (mongoose.Types.ObjectId.isValid(id)) {
-      query = {
-        owner: userId,
-        $or: [{ _id: id }, { invoiceNumber: id }]
-      };
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized.",
+      });
     }
 
-    const invoice = await Invoice.findOne(query);
+    const invoice = await Invoice.findOne(
+      invoiceQuery(req.params.id, userId)
+    );
 
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: "Invoice not found"
+        message: "Invoice not found.",
       });
     }
 
-    res.json({
+    return res.status(200).json({
       success: true,
-      data: invoice
+      data: invoice,
     });
+  } catch (error) {
+    console.error("Get Invoice Error:", error);
 
-  } catch (err) {
-
-    console.error("GET invoice error:", err);
-
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
-      message: "Error fetching invoice"
+      message: "Error fetching invoice.",
     });
   }
 }
@@ -182,78 +216,112 @@ export async function getInvoiceById(req, res) {
 
 export async function updateInvoice(req, res) {
   try {
+    const userId = req.auth?.userId;
 
-    const auth = req.auth;
-    const userId = auth?.userId;
-    const id = req.params.id;
-
-    let updateData = { ...req.body };
-
-    if (updateData.items || updateData.taxPercent !== undefined) {
-
-      const totals = computeTotals(
-        updateData.items || [],
-        updateData.taxPercent || 0
-      );
-
-      updateData = {
-        ...updateData,
-        ...totals
-      };
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized.",
+      });
     }
 
-    let query = { owner: userId, invoiceNumber: id };
-
-    if (mongoose.Types.ObjectId.isValid(id)) {
-      query = {
-        owner: userId,
-        $or: [{ _id: id }, { invoiceNumber: id }]
-      };
-    }
-
-    const updated = await Invoice.findOneAndUpdate(
-      query,
-      updateData,
-      {
-        new: true,
-        runValidators: true
-      }
+    const invoice = await Invoice.findOne(
+      invoiceQuery(req.params.id, userId)
     );
 
-    if (!updated) {
+    if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: "Invoice not found"
+        message: "Invoice not found.",
       });
     }
 
-    /* ---------------- CREATE NEW RAZORPAY ORDER ---------------- */
+    const updateData = { ...req.body };
 
-    if (updated.total) {
+    // Protect ownership, payment records and calculated fields.
+    const protectedFields = [
+      "owner",
+      "_id",
+      "paidAmount",
+      "remainingAmount",
+      "subtotal",
+      "tax",
+      "total",
+      "status",
+      "razorpayOrderId",
+      "razorpayPaymentId",
+      "razorpayPaymentIds",
+      "razorpaySignature",
+    ];
 
-      const order = await razorpay.orders.create({
-        amount: Math.round(updated.total * 100),
-        currency: "INR",
-        receipt: updated.invoiceNumber
-      });
-
-      updated.razorpayOrderId = order.id;
-
-      await updated.save();
-    }
-
-    res.json({
-      success: true,
-      data: updated
+    protectedFields.forEach((field) => {
+      delete updateData[field];
     });
 
-  } catch (err) {
+    const newItems =
+      updateData.items !== undefined
+        ? updateData.items
+        : invoice.items;
 
-    console.error("Update invoice error:", err);
+    const newTaxPercent =
+      updateData.taxPercent !== undefined
+        ? Number(updateData.taxPercent)
+        : Number(invoice.taxPercent || 0);
 
-    res.status(500).json({
+    if (!Array.isArray(newItems)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid invoice items.",
+      });
+    }
+
+    if (
+      !Number.isFinite(newTaxPercent) ||
+      newTaxPercent < 0 ||
+      newTaxPercent > 100
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid tax percentage.",
+      });
+    }
+
+    const totals = computeTotals(
+      newItems,
+      newTaxPercent
+    );
+
+    // Do not allow invoice edits to reduce the total below
+    // the amount already received.
+    if (totals.total < Number(invoice.paidAmount || 0)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Invoice total cannot be less than the amount already paid.",
+      });
+    }
+
+    Object.assign(invoice, updateData);
+
+    invoice.items = newItems;
+    invoice.taxPercent = newTaxPercent;
+
+    invoice.subtotal = totals.subtotal;
+    invoice.tax = totals.tax;
+    invoice.total = totals.total;
+
+    await invoice.save();
+
+    return res.status(200).json({
+      success: true,
+      data: invoice,
+    });
+  } catch (error) {
+    console.error("Update Invoice Error:", error);
+
+    return res.status(500).json({
       success: false,
-      message: err.message
+      message: "Invoice update failed.",
     });
   }
 }
@@ -262,46 +330,47 @@ export async function updateInvoice(req, res) {
 
 export async function deleteInvoice(req, res) {
   try {
+    const userId = req.auth?.userId;
 
-    const auth = req.auth;
-    const userId = auth?.userId;
-    const id = req.params.id;
-
-    let invoice = null;
-
-    if (mongoose.Types.ObjectId.isValid(id)) {
-      invoice = await Invoice.findOneAndDelete({
-        _id: id,
-        owner: userId
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized.",
       });
     }
 
-    if (!invoice) {
-      invoice = await Invoice.findOneAndDelete({
-        invoiceNumber: id,
-        owner: userId
-      });
-    }
+    const invoice = await Invoice.findOne(
+      invoiceQuery(req.params.id, userId)
+    );
 
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: "Invoice not found"
+        message: "Invoice not found.",
       });
     }
 
-    res.json({
+    // Preserve invoices that have received payments.
+    if (Number(invoice.paidAmount || 0) > 0) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "An invoice with recorded payments cannot be deleted.",
+      });
+    }
+
+    await invoice.deleteOne();
+
+    return res.status(200).json({
       success: true,
-      message: "Invoice deleted successfully"
+      message: "Invoice deleted successfully.",
     });
+  } catch (error) {
+    console.error("Delete Invoice Error:", error);
 
-  } catch (err) {
-
-    console.error("Delete invoice error:", err);
-
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
-      message: "Error deleting invoice"
+      message: "Invoice deletion failed.",
     });
   }
 }
