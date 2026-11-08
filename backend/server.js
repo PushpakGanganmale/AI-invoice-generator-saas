@@ -13,6 +13,7 @@ import invoiceRouter from "./routes/invoiceRouter.js";
 import bussinessProfileRouter from "./routes/bussinessProfileRouter.js";
 import aiInvoiceRouter from "./routes/aiInvoiceRouter.js";
 import paymentRouter from "./routes/paymentRouter.js";
+import { razorpayWebhook } from "./controllers/paymentWebhook.js";
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -48,6 +49,17 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+
+/* ---------------- RAZORPAY WEBHOOK ----------------
+   Must be registered BEFORE express.json() and clerkMiddleware():
+   it needs the raw body for signature verification and has no Clerk auth. */
+
+app.post(
+  "/api/payment/webhook",
+  express.raw({ type: "application/json", limit: "1mb" }),
+  (req, res, next) => ensureDBConnection(req, res, next),
+  razorpayWebhook
+);
 
 /* ---------------- MIDDLEWARE ---------------- */
 

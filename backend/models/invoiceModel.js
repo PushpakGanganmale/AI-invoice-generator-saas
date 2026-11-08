@@ -68,7 +68,22 @@ terms: { type: String, default: "" },
 
 razorpayOrderId: { type: String, default: null },
 razorpayPaymentId: { type: String, default: null },
-razorpaySignature: { type: String, default: null }
+razorpaySignature: { type: String, default: null },
+
+/* every captured payment, used so a payment is never counted twice */
+payments: {
+type: [
+{
+_id: false,
+paymentId: { type: String, required: true },
+orderId: { type: String },
+amount: { type: Number },
+method: { type: String },
+at: { type: Date, default: Date.now },
+},
+],
+default: [],
+},
 
 },
 { timestamps: true }
@@ -109,6 +124,7 @@ InvoiceSchema.index(
 );
 
 InvoiceSchema.index({ owner: 1, createdAt: -1 });
+InvoiceSchema.index({ "payments.paymentId": 1 });
 
 const Invoice =
 mongoose.models.Invoice ||

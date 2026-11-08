@@ -140,6 +140,10 @@ export default function InvoicePreview() {
     () => readJSON("business_profile", defaultProfile) || defaultProfile
   );
   const [profileLoading, setProfileLoading] = useState(false);
+  const pollRef = useRef(null);
+  const doneRef = useRef(false);
+
+  useEffect(() => () => clearInterval(pollRef.current), []);
 
   const prevTitleRef = useRef(document.title);
 
@@ -268,6 +272,7 @@ export default function InvoicePreview() {
 
   const handlePayment = async () => {
     try {
+      doneRef.current = false;
       const token = await obtainToken();
 
       const res = await fetch(`${API_BASE}/api/payment/create-order`, {
@@ -300,6 +305,7 @@ export default function InvoicePreview() {
         order_id: order.id,
 
         handler: async function (response) {
+          console.log("[RZP] handler fired", response);
           try {
             // Login tokens last ~60s and a UPI QR payment can take longer,
             // so get a fresh one instead of reusing the token from before payment.
@@ -319,10 +325,10 @@ export default function InvoicePreview() {
                 razorpay_signature: response.razorpay_signature,
               }),
             });
+            console.log("[RZP] update-payment status", upRes.status);
             if (!upRes.ok) throw new Error("update-payment failed");
 
-            alert("Payment Successful!");
-            navigate("/app/invoices");
+            finishPayment();
           } catch (err) {
             console.error(err);
             alert("Payment received, but updating the invoice failed. Please refresh.");
@@ -335,11 +341,53 @@ export default function InvoicePreview() {
           contact: client?.phone || "",
         },
 
+        modal: {
+          ondismiss: () => {
+            console.log("[RZP] modal dismissed");
+            // keep checking for a minute in case a UPI payment is still settling
+            setTimeout(() => clearInterval(pollRef.current), 60000);
+          },
+        },
+
         theme: { color: "#16a34a" },
+      };
+
+      const finishPayment = () => {
+        if (doneRef.current) return;
+        doneRef.current = true;
+        clearInterval(pollRef.current);
+        alert("Payment Successful!");
+        navigate("/app/invoices");
       };
 
       const razor = new window.Razorpay(options);
       razor.open();
+
+      // Fallback: ask the backend to check Razorpay directly, so the invoice
+      // updates even if the browser never calls the handler (e.g. UPI QR).
+      const startPaid = Number(invoice.paidAmount) || 0;
+      const startedAt = Date.now();
+      clearInterval(pollRef.current);
+      pollRef.current = setInterval(async () => {
+        if (doneRef.current || Date.now() - startedAt > 10 * 60 * 1000) {
+          return clearInterval(pollRef.current);
+        }
+        try {
+          const tk = (await obtainToken()) || token;
+          const r = await fetch(`${API_BASE}/api/payment/sync`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${tk}` },
+            body: JSON.stringify({ invoiceId: invoice._id || invoice.id }),
+          });
+          const j = await r.json().catch(() => null);
+          if (j?.invoice && (Number(j.invoice.paidAmount) || 0) > startPaid) {
+            console.log("[RZP] sync detected payment", j.invoice.status);
+            finishPayment();
+          }
+        } catch (e) {
+          console.warn("[RZP] sync error", e);
+        }
+      }, 4000);
     } catch (err) {
       console.error(err);
       alert("Payment failed");

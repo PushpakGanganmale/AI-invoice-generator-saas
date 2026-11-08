@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import Razorpay from "razorpay";
+import { getAuth } from "@clerk/express";
 import Invoice from "../models/invoiceModel.js";
 
 const razorpay = new Razorpay({
@@ -11,8 +12,35 @@ const round2 = (n) => Number(Number(n).toFixed(2));
 
 // If the route is behind Clerk auth, only the invoice owner may pay / update it.
 function canAccess(req, invoice) {
-  const userId = req.auth?.userId;
-  return !userId || invoice.owner === userId;
+  const { userId } = getAuth(req);
+  return Boolean(userId) && invoice.owner === userId;
+}
+
+// Records a captured payment exactly once, even if update-payment and sync
+// run at the same time (the razorpayPaymentId filter makes the claim atomic).
+async function recordPayment(invoiceId, payment) {
+  const claimed = await Invoice.findOneAndUpdate(
+    { _id: invoiceId, razorpayPaymentId: { $ne: payment.id } },
+    { $set: { razorpayPaymentId: payment.id } },
+    { new: true }
+  );
+
+  if (!claimed) {
+    return { recorded: false, invoice: await Invoice.findById(invoiceId) };
+  }
+
+  try {
+    // pre("save") hook auto-calculates remainingAmount and status
+    claimed.paidAmount = round2(
+      (Number(claimed.paidAmount) || 0) + Number(payment.amount) / 100
+    );
+    await claimed.save();
+  } catch (err) {
+    await Invoice.updateOne({ _id: invoiceId }, { $set: { razorpayPaymentId: null } });
+    throw err;
+  }
+
+  return { recorded: true, invoice: claimed };
 }
 
 /* ---------------- CREATE ORDER ---------------- */
@@ -182,18 +210,27 @@ export const updatePayment = async (req, res) => {
 
     /* -------- AMOUNT COMES FROM RAZORPAY, NOT FROM THE BROWSER -------- */
 
-    const rzOrder = await razorpay.orders.fetch(razorpay_order_id);
-    const paidNow = round2(Number(rzOrder.amount) / 100);
+    const payment = await razorpay.payments.fetch(razorpay_payment_id);
 
-    // pre("save") hook auto-calculates remainingAmount and status
-    invoice.paidAmount = round2((Number(invoice.paidAmount) || 0) + paidNow);
-    invoice.razorpayPaymentId = razorpay_payment_id;
-    invoice.razorpaySignature = razorpay_signature;
-    await invoice.save();
+    if (payment.order_id !== razorpay_order_id) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment does not match this order",
+      });
+    }
+
+    if (payment.status !== "captured") {
+      return res.status(409).json({
+        success: false,
+        message: `Payment is ${payment.status}, not captured yet`,
+      });
+    }
+
+    const result = await recordPayment(invoice._id, payment);
 
     res.json({
       success: true,
-      invoice,
+      invoice: result.invoice,
     });
   } catch (error) {
     console.error("Payment Update Error:", error);
@@ -202,5 +239,44 @@ export const updatePayment = async (req, res) => {
       success: false,
       message: "Payment update failed",
     });
+  }
+};
+
+/* ---------------- SYNC (asks Razorpay directly; safe to call repeatedly) ---------------- */
+
+export const syncPayment = async (req, res) => {
+  try {
+    const { invoiceId } = req.body;
+
+    if (!invoiceId) {
+      return res.status(400).json({ success: false, message: "Invoice ID is required" });
+    }
+
+    const invoice = await Invoice.findById(invoiceId);
+
+    if (!invoice) {
+      return res.status(404).json({ success: false, message: "Invoice not found" });
+    }
+
+    if (!canAccess(req, invoice)) {
+      return res.status(403).json({ success: false, message: "Not allowed" });
+    }
+
+    let current = invoice;
+
+    if (invoice.razorpayOrderId && invoice.status !== "paid") {
+      const list = await razorpay.orders.fetchPayments(invoice.razorpayOrderId);
+      const captured = (list?.items || []).find((p) => p.status === "captured");
+
+      if (captured) {
+        const result = await recordPayment(invoice._id, captured);
+        current = result.invoice;
+      }
+    }
+
+    res.json({ success: true, invoice: current });
+  } catch (error) {
+    console.error("Sync Payment Error:", error);
+    res.status(500).json({ success: false, message: "Payment sync failed" });
   }
 };
