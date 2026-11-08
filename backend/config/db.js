@@ -1,17 +1,48 @@
+
 import mongoose from "mongoose";
 
+let connectionPromise = null;
+
 export const connectDB = async () => {
-  try {
+  const mongoURI = process.env.MONGO_URI;
+
+  if (!mongoURI) {
+    throw new Error("MONGO_URI environment variable is missing");
+  }
+
+  // Reuse an existing connection.
+  if (mongoose.connection.readyState === 1) {
+    return mongoose;
+  }
+
+  // Reset a stale connection promise.
+  if (mongoose.connection.readyState === 0) {
+    connectionPromise = null;
+  }
+
+  // Prevent multiple simultaneous connection attempts.
+  if (!connectionPromise) {
     console.log("Connecting to MongoDB...");
 
-    const conn = await mongoose.connect(process.env.MONGO_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-    });
+    connectionPromise = mongoose
+      .connect(mongoURI, {
+        serverSelectionTimeoutMS: 10000,
+      })
+      .then(() => {
+        console.log(
+          `MongoDB Connected: ${mongoose.connection.host}`
+        );
 
-    console.log(`MongoDB Connected: ${conn.connection.host}`);
-  } catch (error) {
-    console.error("MongoDB connection error:", error.message);
-    process.exit(1);
+        return mongoose;
+      })
+      .catch((error) => {
+        connectionPromise = null;
+        console.error("MongoDB connection error:", error.message);
+        throw error;
+      });
   }
+
+  await connectionPromise;
+
+  return mongoose;
 };

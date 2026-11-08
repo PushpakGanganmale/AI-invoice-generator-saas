@@ -23,50 +23,37 @@ const allowedOrigins = [
   "https://frontend-kohl-six-85.vercel.app",
 ];
 
-const corsOptions = {
-  origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
 
-    console.error("CORS blocked origin:", origin);
-
-    return callback(new Error(`CORS blocked origin: ${origin}`));
-  },
-
-  credentials: true,
-
-  methods: [
-    "GET",
-    "POST",
-    "PUT",
-    "PATCH",
-    "DELETE",
-    "OPTIONS",
-  ],
-
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "Accept",
-  ],
-};
-
-app.use(cors(corsOptions));
+      console.error("CORS blocked origin:", origin);
+      return callback(new Error("Origin not allowed by CORS"));
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "Accept",
+    ],
+  })
+);
 
 /* ---------------- BODY PARSING ---------------- */
 
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 
-/* ---------------- CLERK AUTHENTICATION ---------------- */
+/* ---------------- CLERK ---------------- */
 
 app.use(clerkMiddleware());
 
 /* ---------------- STATIC FILES ---------------- */
 
-// Vercel deployment filesystem is read-only.
-// Persistent uploaded files require cloud storage.
 if (process.env.VERCEL !== "1") {
   app.use(
     "/uploads",
@@ -74,31 +61,38 @@ if (process.env.VERCEL !== "1") {
   );
 }
 
-/* ---------------- HEALTH CHECK ---------------- */
+/* ---------------- ROOT ---------------- */
 
 app.get("/", (req, res) => {
   res.status(200).send("InvoiceGenius API Working");
 });
 
-app.get("/api/health", async (req, res) => {
+/* ---------------- DATABASE CONNECTION ---------------- */
+
+// Connect before executing any API route.
+app.use("/api", async (req, res, next) => {
   try {
     await connectDB();
-
-    res.status(200).json({
-      success: true,
-      status: "ok",
-      message: "InvoiceGenius backend is running",
-      database: "connected",
-    });
+    next();
   } catch (error) {
-    console.error("Health check database error:", error);
+    console.error("Database middleware error:", error);
 
-    res.status(500).json({
+    res.status(503).json({
       success: false,
-      status: "error",
       message: "Database connection failed",
     });
   }
+});
+
+/* ---------------- HEALTH CHECK ---------------- */
+
+app.get("/api/health", (req, res) => {
+  res.status(200).json({
+    success: true,
+    status: "ok",
+    message: "InvoiceGenius backend is running",
+    database: "connected",
+  });
 });
 
 /* ---------------- API ROUTES ---------------- */
@@ -115,7 +109,7 @@ app.use("/api/ai-invoices", requireAuth(), aiInvoiceRouter);
 
 app.use("/api/payment", requireAuth(), paymentRouter);
 
-/* ---------------- 404 HANDLER ---------------- */
+/* ---------------- 404 ---------------- */
 
 app.use((req, res) => {
   res.status(404).json({
@@ -139,10 +133,7 @@ app.use((err, req, res, next) => {
   });
 });
 
-/* ---------------- SERVER STARTUP ---------------- */
-
-// Vercel uses the exported Express application.
-// Local development uses app.listen().
+/* ---------------- LOCAL SERVER ---------------- */
 
 if (process.env.VERCEL !== "1") {
   const startServer = async () => {
@@ -150,7 +141,7 @@ if (process.env.VERCEL !== "1") {
       await connectDB();
 
       app.listen(port, () => {
-        console.log(`InvoiceGenius server running on port ${port}`);
+        console.log(`InvoiceGenius running on port ${port}`);
       });
     } catch (error) {
       console.error("Server startup failed:", error);
