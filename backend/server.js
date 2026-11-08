@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
@@ -31,8 +32,6 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-
-// Handle preflight requests for all routes
 app.options("*", cors(corsOptions));
 
 /* ---------------- MIDDLEWARE ---------------- */
@@ -46,49 +45,96 @@ app.use(clerkMiddleware());
 
 app.use("/uploads", express.static(path.join(process.cwd(), "uploads")));
 
-/* ---------------- TEST ROUTES ---------------- */
+/* ---------------- HEALTH ROUTES ---------------- */
 
 app.get("/", (req, res) => {
-  res.send("API Working");
+  res.status(200).send("InvoiceGenius API Working");
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok" });
+  res.status(200).json({
+    success: true,
+    status: "ok",
+    message: "InvoiceGenius backend is running",
+  });
 });
 
-/* ---------------- API ROUTES ---------------- */
+/* ---------------- DATABASE CONNECTION ---------------- */
+
+let dbConnectionPromise;
+
+const ensureDBConnection = async (req, res, next) => {
+  try {
+    if (process.env.MONGO_URI === undefined) {
+      throw new Error("MONGO_URI environment variable is missing");
+    }
+
+    if (mongoose.connection.readyState === 1) {
+      return next();
+    }
+
+    if (!dbConnectionPromise) {
+      dbConnectionPromise = connectDB().catch((error) => {
+        dbConnectionPromise = null;
+        throw error;
+      });
+    }
+
+    await dbConnectionPromise;
+    next();
+  } catch (error) {
+    console.error("Database connection failed:", error.message);
+
+    res.status(503).json({
+      success: false,
+      message: "Database connection unavailable",
+    });
+  }
+};
 
 /* ---------------- API ROUTES ---------------- */
 
-app.use("/api/invoices", requireAuth(), invoiceRouter);
+app.use("/api/invoices", ensureDBConnection, requireAuth(), invoiceRouter);
 
-app.use("/api/business-profile", requireAuth(), bussinessProfileRouter);
+app.use(
+  "/api/business-profile",
+  ensureDBConnection,
+  requireAuth(),
+  bussinessProfileRouter
+);
 
-app.use("/api/ai-invoices", requireAuth(), aiInvoiceRouter);
+app.use("/api/ai-invoices", ensureDBConnection, requireAuth(), aiInvoiceRouter);
 
-app.use("/api/payment", requireAuth(), paymentRouter);
+app.use("/api/payment", ensureDBConnection, requireAuth(), paymentRouter);
 
 /* ---------------- ERROR HANDLER ---------------- */
 
 app.use((err, req, res, next) => {
   console.error("Server Error:", err);
-  res.status(500).json({
+
+  res.status(err.status || 500).json({
     success: false,
     message: err.message || "Internal server error",
   });
 });
 
-/* ---------------- START SERVER ---------------- */
+/* ---------------- 404 HANDLER ---------------- */
 
-const startServer = async () => {
-  try {
-    await connectDB();
-    app.listen(port, () => {
-      console.log(`🚀 Server running on port ${port}`);
-    });
-  } catch (err) {
-    console.error("Server start error:", err);
-  }
-};
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: `Route not found: ${req.method} ${req.originalUrl}`,
+  });
+});
 
-startServer();
+/* ---------------- EXPORT APP ---------------- */
+
+export default app;
+
+/* ---------------- LOCAL SERVER ---------------- */
+
+if (process.env.NODE_ENV !== "production") {
+  app.listen(port, () => {
+    console.log(`InvoiceGenius server running on port ${port}`);
+  });
+}
