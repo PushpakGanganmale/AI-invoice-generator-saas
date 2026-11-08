@@ -4,10 +4,17 @@ import Invoice from "../models/invoiceModel.js";
 
 /* ---------------- RAZORPAY INSTANCE ---------------- */
 
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET
-});
+// Created on first use, so a missing key can't crash the whole server at startup.
+let razorpayClient = null;
+const getRazorpay = () => {
+  if (!razorpayClient) {
+    razorpayClient = new Razorpay({
+      key_id: process.env.RAZORPAY_KEY_ID,
+      key_secret: process.env.RAZORPAY_KEY_SECRET
+    });
+  }
+  return razorpayClient;
+};
 
 /* ---------------- HELPER ---------------- */
 
@@ -231,7 +238,7 @@ export async function updateInvoice(req, res) {
 
     if (updated.total) {
 
-      const order = await razorpay.orders.create({
+      const order = await getRazorpay().orders.create({
         amount: Math.round(updated.total * 100),
         currency: "INR",
         receipt: updated.invoiceNumber

@@ -3,10 +3,17 @@ import Razorpay from "razorpay";
 import { getAuth } from "@clerk/express";
 import Invoice from "../models/invoiceModel.js";
 
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
+// Created on first use, so a missing key can't crash the whole server at startup.
+let razorpayClient = null;
+const getRazorpay = () => {
+  if (!razorpayClient) {
+    razorpayClient = new Razorpay({
+      key_id: process.env.RAZORPAY_KEY_ID,
+      key_secret: process.env.RAZORPAY_KEY_SECRET,
+    });
+  }
+  return razorpayClient;
+};
 
 const round2 = (n) => Number(Number(n).toFixed(2));
 
@@ -105,7 +112,7 @@ export const createOrder = async (req, res) => {
 
     /* -------- CREATE RAZORPAY ORDER -------- */
 
-    const order = await razorpay.orders.create({
+    const order = await getRazorpay().orders.create({
       amount: Math.round(Number(amount) * 100),
       currency: "INR",
       receipt: `invoice_${invoice._id}`,
@@ -210,7 +217,7 @@ export const updatePayment = async (req, res) => {
 
     /* -------- AMOUNT COMES FROM RAZORPAY, NOT FROM THE BROWSER -------- */
 
-    const payment = await razorpay.payments.fetch(razorpay_payment_id);
+    const payment = await getRazorpay().payments.fetch(razorpay_payment_id);
 
     if (payment.order_id !== razorpay_order_id) {
       return res.status(400).json({
@@ -265,7 +272,7 @@ export const syncPayment = async (req, res) => {
     let current = invoice;
 
     if (invoice.razorpayOrderId && invoice.status !== "paid") {
-      const list = await razorpay.orders.fetchPayments(invoice.razorpayOrderId);
+      const list = await getRazorpay().orders.fetchPayments(invoice.razorpayOrderId);
       const captured = (list?.items || []).find((p) => p.status === "captured");
 
       if (captured) {

@@ -1,0 +1,420 @@
+From 635efbc4565f0a0e977bc0d3480faa5a06baa278 Mon Sep 17 00:00:00 2001
+From: dev <dev@example.com>
+Date: Sun, 8 Nov 2026 10:13:43 +0000
+Subject: [PATCH] Fix Razorpay: verify captured payment, idempotent recording,
+ add webhook
+
+---
+ backend/controllers/paymentController.js  | 100 ++++++++++++++--------
+ backend/controllers/paymentWebhook.js     |  50 +++++++++++
+ backend/models/invoiceModel.js            |  18 +++-
+ backend/server.js                         |  12 +++
+ frontend/src/component/InvoicePreview.jsx |  49 +++++++++--
+ 5 files changed, 185 insertions(+), 44 deletions(-)
+ create mode 100644 backend/controllers/paymentWebhook.js
+
+diff --git a/backend/controllers/paymentController.js b/backend/controllers/paymentController.js
+index a8144a4..1c7644c 100644
+--- a/backend/controllers/paymentController.js
++++ b/backend/controllers/paymentController.js
+@@ -1,5 +1,6 @@
+ import crypto from "crypto";
+ import Razorpay from "razorpay";
++import { getAuth } from "@clerk/express";
+ import Invoice from "../models/invoiceModel.js";
+ 
+ const razorpay = new Razorpay({
+@@ -11,8 +12,41 @@ const round2 = (n) => Number(Number(n).toFixed(2));
+ 
+ // If the route is behind Clerk auth, only the invoice owner may pay / update it.
+ function canAccess(req, invoice) {
+-  const userId = req.auth?.userId;
+-  return !userId || invoice.owner === userId;
++  const { userId } = getAuth(req);
++  return Boolean(userId) && invoice.owner === userId;
++}
++
++/**
++ * Idempotent: called by BOTH the browser (update-payment) and the webhook.
++ * The $ne filter makes the push atomic, so only one caller can record a
++ * given payment id. Razorpay amounts are paise; paidAmount is rupees.
++ */
++export async function recordPayment(invoiceId, payment) {
++  const amount = round2(Number(payment.amount) / 100);
++
++  const updated = await Invoice.findOneAndUpdate(
++    { _id: invoiceId, "payments.paymentId": { $ne: payment.id } },
++    {
++      $push: {
++        payments: {
++          paymentId: payment.id,
++          orderId: payment.order_id,
++          amount,
++          method: payment.method,
++          at: new Date(),
++        },
++      },
++    },
++    { new: true }
++  );
++
++  if (!updated) return { recorded: false }; // already recorded, or invoice missing
++
++  // pre("save") hook recalculates remainingAmount and status
++  updated.paidAmount = round2((Number(updated.paidAmount) || 0) + amount);
++  updated.razorpayPaymentId = payment.id;
++  await updated.save();
++  return { recorded: true, invoice: updated };
+ }
+ 
+ /* ---------------- CREATE ORDER ---------------- */
+@@ -81,6 +115,7 @@ export const createOrder = async (req, res) => {
+       amount: Math.round(Number(amount) * 100),
+       currency: "INR",
+       receipt: `invoice_${invoice._id}`,
++      notes: { invoiceId: String(invoice._id) }, // lets the webhook find the invoice
+     });
+ 
+     /* -------- SYNC INVOICE + REMEMBER THE ORDER -------- */
+@@ -141,28 +176,6 @@ export const updatePayment = async (req, res) => {
+       });
+     }
+ 
+-    /* -------- ALREADY RECORDED (e.g. the request was sent twice) -------- */
+-
+-    if (invoice.razorpayPaymentId === razorpay_payment_id) {
+-      return res.json({ success: true, invoice });
+-    }
+-
+-    if (invoice.status === "paid") {
+-      return res.status(400).json({
+-        success: false,
+-        message: "Invoice is already fully paid",
+-      });
+-    }
+-
+-    /* -------- THE ORDER MUST BELONG TO THIS INVOICE -------- */
+-
+-    if (invoice.razorpayOrderId !== razorpay_order_id) {
+-      return res.status(400).json({
+-        success: false,
+-        message: "Order does not match this invoice",
+-      });
+-    }
+-
+     /* -------- VERIFY RAZORPAY SIGNATURE -------- */
+ 
+     const expected = crypto
+@@ -174,26 +187,45 @@ export const updatePayment = async (req, res) => {
+     const b = Buffer.from(String(razorpay_signature));
+ 
+     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
++      console.error(
++        "Signature mismatch: check RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET are the same mode (test vs live)"
++      );
+       return res.status(400).json({
+         success: false,
+         message: "Payment verification failed",
+       });
+     }
+ 
+-    /* -------- AMOUNT COMES FROM RAZORPAY, NOT FROM THE BROWSER -------- */
++    /* -------- FETCH THE PAYMENT FROM RAZORPAY (never trust the browser) -------- */
+ 
+-    const rzOrder = await razorpay.orders.fetch(razorpay_order_id);
+-    const paidNow = round2(Number(rzOrder.amount) / 100);
++    const payment = await razorpay.payments.fetch(razorpay_payment_id);
+ 
+-    // pre("save") hook auto-calculates remainingAmount and status
+-    invoice.paidAmount = round2((Number(invoice.paidAmount) || 0) + paidNow);
+-    invoice.razorpayPaymentId = razorpay_payment_id;
+-    invoice.razorpaySignature = razorpay_signature;
+-    await invoice.save();
++    if (
++      payment.order_id !== razorpay_order_id ||
++      payment.notes?.invoiceId !== String(invoice._id)
++    ) {
++      return res.status(400).json({
++        success: false,
++        message: "Payment does not match this invoice",
++      });
++    }
+ 
+-    res.json({
++    if (payment.status !== "captured") {
++      return res.status(409).json({
++        success: false,
++        message: `Payment is ${payment.status}, not captured yet`,
++      });
++    }
++
++    /* -------- RECORD (idempotent, safe if the webhook already did it) -------- */
++
++    const result = await recordPayment(invoice._id, payment);
++    const fresh = result.invoice || (await Invoice.findById(invoice._id));
++
++    return res.json({
+       success: true,
+-      invoice,
++      alreadyProcessed: !result.recorded,
++      invoice: fresh,
+     });
+   } catch (error) {
+     console.error("Payment Update Error:", error);
+diff --git a/backend/controllers/paymentWebhook.js b/backend/controllers/paymentWebhook.js
+new file mode 100644
+index 0000000..6ed1724
+--- /dev/null
++++ b/backend/controllers/paymentWebhook.js
+@@ -0,0 +1,50 @@
++import crypto from "crypto";
++import { recordPayment } from "./paymentController.js";
++
++/**
++ * Mounted in server.js with express.raw() BEFORE express.json() and Clerk,
++ * so req.body is the untouched Buffer needed for signature verification.
++ */
++export const razorpayWebhook = async (req, res) => {
++  try {
++    const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
++    const signature = req.headers["x-razorpay-signature"];
++
++    if (!secret || !signature || !Buffer.isBuffer(req.body)) {
++      console.error("Webhook rejected: missing secret/signature or body is not raw");
++      return res.status(400).send("Bad request");
++    }
++
++    const expected = crypto.createHmac("sha256", secret).update(req.body).digest("hex");
++    const a = Buffer.from(expected);
++    const b = Buffer.from(String(signature));
++
++    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
++      console.error("Webhook rejected: invalid signature");
++      return res.status(400).send("Invalid signature");
++    }
++
++    const event = JSON.parse(req.body.toString("utf8"));
++
++    if (event.event === "payment.captured" || event.event === "order.paid") {
++      const payment = event.payload?.payment?.entity;
++      const invoiceId = payment?.notes?.invoiceId;
++
++      if (payment && invoiceId && payment.status === "captured") {
++        const result = await recordPayment(invoiceId, payment);
++        console.log(
++          `Webhook ${event.event} ${payment.id}:`,
++          result.recorded ? "recorded" : "already recorded"
++        );
++      } else {
++        console.warn("Webhook: no invoiceId note or not captured", payment?.id);
++      }
++    }
++
++    // 200 for any validly signed event so Razorpay stops retrying
++    return res.status(200).json({ received: true });
++  } catch (err) {
++    console.error("Webhook error:", err);
++    return res.status(500).send("Server error"); // Razorpay will retry
++  }
++};
+diff --git a/backend/models/invoiceModel.js b/backend/models/invoiceModel.js
+index a7df863..75594ff 100644
+--- a/backend/models/invoiceModel.js
++++ b/backend/models/invoiceModel.js
+@@ -68,7 +68,22 @@ terms: { type: String, default: "" },
+ 
+ razorpayOrderId: { type: String, default: null },
+ razorpayPaymentId: { type: String, default: null },
+-razorpaySignature: { type: String, default: null }
++razorpaySignature: { type: String, default: null },
++
++/* every captured payment, used so a payment is never counted twice */
++payments: {
++type: [
++{
++_id: false,
++paymentId: { type: String, required: true },
++orderId: { type: String },
++amount: { type: Number },
++method: { type: String },
++at: { type: Date, default: Date.now },
++},
++],
++default: [],
++},
+ 
+ },
+ { timestamps: true }
+@@ -109,6 +124,7 @@ InvoiceSchema.index(
+ );
+ 
+ InvoiceSchema.index({ owner: 1, createdAt: -1 });
++InvoiceSchema.index({ "payments.paymentId": 1 });
+ 
+ const Invoice =
+ mongoose.models.Invoice ||
+diff --git a/backend/server.js b/backend/server.js
+index a1cf75b..6806fae 100644
+--- a/backend/server.js
++++ b/backend/server.js
+@@ -13,6 +13,7 @@ import invoiceRouter from "./routes/invoiceRouter.js";
+ import bussinessProfileRouter from "./routes/bussinessProfileRouter.js";
+ import aiInvoiceRouter from "./routes/aiInvoiceRouter.js";
+ import paymentRouter from "./routes/paymentRouter.js";
++import { razorpayWebhook } from "./controllers/paymentWebhook.js";
+ 
+ const app = express();
+ const port = process.env.PORT || 4000;
+@@ -49,6 +50,17 @@ const corsOptions = {
+ 
+ app.use(cors(corsOptions));
+ 
++/* ---------------- RAZORPAY WEBHOOK ----------------
++   Must be registered BEFORE express.json() and clerkMiddleware():
++   it needs the raw body for signature verification and has no Clerk auth. */
++
++app.post(
++  "/api/payment/webhook",
++  express.raw({ type: "application/json", limit: "1mb" }),
++  (req, res, next) => ensureDBConnection(req, res, next),
++  razorpayWebhook
++);
++
+ /* ---------------- MIDDLEWARE ---------------- */
+ 
+ app.use(express.json({ limit: "20mb" }));
+diff --git a/frontend/src/component/InvoicePreview.jsx b/frontend/src/component/InvoicePreview.jsx
+index 2a382fb..f41a77b 100644
+--- a/frontend/src/component/InvoicePreview.jsx
++++ b/frontend/src/component/InvoicePreview.jsx
+@@ -140,6 +140,7 @@ export default function InvoicePreview() {
+     () => readJSON("business_profile", defaultProfile) || defaultProfile
+   );
+   const [profileLoading, setProfileLoading] = useState(false);
++  const [paying, setPaying] = useState(false);
+ 
+   const prevTitleRef = useRef(document.title);
+ 
+@@ -267,6 +268,8 @@ export default function InvoicePreview() {
+   }, [invoice]);
+ 
+   const handlePayment = async () => {
++    if (paying) return; // prevents double clicks creating extra orders
++    setPaying(true);
+     try {
+       const token = await obtainToken();
+ 
+@@ -285,6 +288,7 @@ export default function InvoicePreview() {
+ 
+       if (!data?.success || !data?.order) {
+         alert(data?.message || "Payment initialization failed");
++        setPaying(false);
+         return;
+       }
+ 
+@@ -294,12 +298,13 @@ export default function InvoicePreview() {
+       const options = {
+         key: import.meta.env.VITE_RAZORPAY_KEY_ID,
+         amount: order.amount,
+-        currency: "INR",
++        currency: order.currency || "INR",
+         name: "Invoice Genius",
+         description: `Invoice Payment - Remaining: ₹${remainingAmount}`,
+         order_id: order.id,
+ 
+         handler: async function (response) {
++          console.log("[RZP] handler fired", response);
+           try {
+             // Login tokens last ~60s and a UPI QR payment can take longer,
+             // so get a fresh one instead of reusing the token from before payment.
+@@ -312,23 +317,36 @@ export default function InvoicePreview() {
+               },
+               body: JSON.stringify({
+                 invoiceId: invoice._id || invoice.id,
+-                amount: remainingAmount,
+-                // sent so the backend can verify the payment signature
++                // the backend takes the amount from Razorpay, never from the browser
+                 razorpay_order_id: response.razorpay_order_id,
+                 razorpay_payment_id: response.razorpay_payment_id,
+                 razorpay_signature: response.razorpay_signature,
+               }),
+             });
+-            if (!upRes.ok) throw new Error("update-payment failed");
++            const upBody = await upRes.json().catch(() => null);
++            console.log("[RZP] update-payment", upRes.status, upBody);
++            if (!upRes.ok) throw new Error(upBody?.message || "update-payment failed");
+ 
+             alert("Payment Successful!");
+             navigate("/app/invoices");
+           } catch (err) {
+-            console.error(err);
+-            alert("Payment received, but updating the invoice failed. Please refresh.");
++            console.error("[RZP] update failed", err);
++            alert(
++              `Payment received, but updating the invoice failed: ${err.message}. ` +
++                "It will be updated automatically shortly; please refresh."
++            );
++          } finally {
++            setPaying(false);
+           }
+         },
+ 
++        modal: {
++          ondismiss: () => {
++            console.log("[RZP] modal dismissed");
++            setPaying(false);
++          },
++        },
++
+         prefill: {
+           name: client?.name || "",
+           email: client?.email || "",
+@@ -338,11 +356,17 @@ export default function InvoicePreview() {
+         theme: { color: "#16a34a" },
+       };
+ 
++      console.log("[RZP] key:", String(options.key).slice(0, 12), "order:", order.id);
+       const razor = new window.Razorpay(options);
++      razor.on("payment.failed", (r) => {
++        console.log("[RZP] payment.failed", r.error);
++        setPaying(false);
++      });
+       razor.open();
+     } catch (err) {
+       console.error(err);
+       alert("Payment failed");
++      setPaying(false);
+     }
+   };
+ 
+@@ -418,8 +442,12 @@ export default function InvoicePreview() {
+             </button>
+ 
+             {invoice.status !== "paid" && (
+-              <button onClick={handlePayment} className="bg-green-600 text-white px-4 py-2 rounded-lg">
+-                Pay Now
++              <button
++                onClick={handlePayment}
++                disabled={paying}
++                className="bg-green-600 text-white px-4 py-2 rounded-lg disabled:opacity-60"
++              >
++                {paying ? "Processing…" : "Pay Now"}
+               </button>
+             )}
+           </div>
+@@ -463,9 +491,12 @@ export default function InvoicePreview() {
+                     invoice.status === "paid" ? invoicePreviewStyles.statusPaid
+                     : invoice.status === "unpaid" ? invoicePreviewStyles.statusUnpaid
+                     : invoice.status === "overdue" ? invoicePreviewStyles.statusOverdue
++                    : invoice.status === "partially_paid" ? invoicePreviewStyles.statusUnpaid
+                     : invoicePreviewStyles.statusDraft
+                   }`}>
+-                    {invoice.status ? invoice.status.charAt(0).toUpperCase() + invoice.status.slice(1) : "Draft"}
++                    {invoice.status
++                      ? invoice.status.replace(/_/g, " ").replace(/^\w/, (c) => c.toUpperCase())
++                      : "Draft"}
+                   </span>
+                 </div>
+               </div>
+-- 
+2.43.0
