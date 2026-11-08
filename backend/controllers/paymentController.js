@@ -16,37 +16,31 @@ function canAccess(req, invoice) {
   return Boolean(userId) && invoice.owner === userId;
 }
 
-/**
- * Idempotent: called by BOTH the browser (update-payment) and the webhook.
- * The $ne filter makes the push atomic, so only one caller can record a
- * given payment id. Razorpay amounts are paise; paidAmount is rupees.
- */
-export async function recordPayment(invoiceId, payment) {
-  const amount = round2(Number(payment.amount) / 100);
-
-  const updated = await Invoice.findOneAndUpdate(
-    { _id: invoiceId, "payments.paymentId": { $ne: payment.id } },
-    {
-      $push: {
-        payments: {
-          paymentId: payment.id,
-          orderId: payment.order_id,
-          amount,
-          method: payment.method,
-          at: new Date(),
-        },
-      },
-    },
+// Records a captured payment exactly once, even if update-payment and sync
+// run at the same time (the razorpayPaymentId filter makes the claim atomic).
+async function recordPayment(invoiceId, payment) {
+  const claimed = await Invoice.findOneAndUpdate(
+    { _id: invoiceId, razorpayPaymentId: { $ne: payment.id } },
+    { $set: { razorpayPaymentId: payment.id } },
     { new: true }
   );
 
-  if (!updated) return { recorded: false }; // already recorded, or invoice missing
+  if (!claimed) {
+    return { recorded: false, invoice: await Invoice.findById(invoiceId) };
+  }
 
-  // pre("save") hook recalculates remainingAmount and status
-  updated.paidAmount = round2((Number(updated.paidAmount) || 0) + amount);
-  updated.razorpayPaymentId = payment.id;
-  await updated.save();
-  return { recorded: true, invoice: updated };
+  try {
+    // pre("save") hook auto-calculates remainingAmount and status
+    claimed.paidAmount = round2(
+      (Number(claimed.paidAmount) || 0) + Number(payment.amount) / 100
+    );
+    await claimed.save();
+  } catch (err) {
+    await Invoice.updateOne({ _id: invoiceId }, { $set: { razorpayPaymentId: null } });
+    throw err;
+  }
+
+  return { recorded: true, invoice: claimed };
 }
 
 /* ---------------- CREATE ORDER ---------------- */
@@ -115,7 +109,6 @@ export const createOrder = async (req, res) => {
       amount: Math.round(Number(amount) * 100),
       currency: "INR",
       receipt: `invoice_${invoice._id}`,
-      notes: { invoiceId: String(invoice._id) }, // lets the webhook find the invoice
     });
 
     /* -------- SYNC INVOICE + REMEMBER THE ORDER -------- */
@@ -176,6 +169,28 @@ export const updatePayment = async (req, res) => {
       });
     }
 
+    /* -------- ALREADY RECORDED (e.g. the request was sent twice) -------- */
+
+    if (invoice.razorpayPaymentId === razorpay_payment_id) {
+      return res.json({ success: true, invoice });
+    }
+
+    if (invoice.status === "paid") {
+      return res.status(400).json({
+        success: false,
+        message: "Invoice is already fully paid",
+      });
+    }
+
+    /* -------- THE ORDER MUST BELONG TO THIS INVOICE -------- */
+
+    if (invoice.razorpayOrderId !== razorpay_order_id) {
+      return res.status(400).json({
+        success: false,
+        message: "Order does not match this invoice",
+      });
+    }
+
     /* -------- VERIFY RAZORPAY SIGNATURE -------- */
 
     const expected = crypto
@@ -187,26 +202,20 @@ export const updatePayment = async (req, res) => {
     const b = Buffer.from(String(razorpay_signature));
 
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-      console.error(
-        "Signature mismatch: check RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET are the same mode (test vs live)"
-      );
       return res.status(400).json({
         success: false,
         message: "Payment verification failed",
       });
     }
 
-    /* -------- FETCH THE PAYMENT FROM RAZORPAY (never trust the browser) -------- */
+    /* -------- AMOUNT COMES FROM RAZORPAY, NOT FROM THE BROWSER -------- */
 
     const payment = await razorpay.payments.fetch(razorpay_payment_id);
 
-    if (
-      payment.order_id !== razorpay_order_id ||
-      payment.notes?.invoiceId !== String(invoice._id)
-    ) {
+    if (payment.order_id !== razorpay_order_id) {
       return res.status(400).json({
         success: false,
-        message: "Payment does not match this invoice",
+        message: "Payment does not match this order",
       });
     }
 
@@ -217,15 +226,11 @@ export const updatePayment = async (req, res) => {
       });
     }
 
-    /* -------- RECORD (idempotent, safe if the webhook already did it) -------- */
-
     const result = await recordPayment(invoice._id, payment);
-    const fresh = result.invoice || (await Invoice.findById(invoice._id));
 
-    return res.json({
+    res.json({
       success: true,
-      alreadyProcessed: !result.recorded,
-      invoice: fresh,
+      invoice: result.invoice,
     });
   } catch (error) {
     console.error("Payment Update Error:", error);
@@ -234,5 +239,44 @@ export const updatePayment = async (req, res) => {
       success: false,
       message: "Payment update failed",
     });
+  }
+};
+
+/* ---------------- SYNC (asks Razorpay directly; safe to call repeatedly) ---------------- */
+
+export const syncPayment = async (req, res) => {
+  try {
+    const { invoiceId } = req.body;
+
+    if (!invoiceId) {
+      return res.status(400).json({ success: false, message: "Invoice ID is required" });
+    }
+
+    const invoice = await Invoice.findById(invoiceId);
+
+    if (!invoice) {
+      return res.status(404).json({ success: false, message: "Invoice not found" });
+    }
+
+    if (!canAccess(req, invoice)) {
+      return res.status(403).json({ success: false, message: "Not allowed" });
+    }
+
+    let current = invoice;
+
+    if (invoice.razorpayOrderId && invoice.status !== "paid") {
+      const list = await razorpay.orders.fetchPayments(invoice.razorpayOrderId);
+      const captured = (list?.items || []).find((p) => p.status === "captured");
+
+      if (captured) {
+        const result = await recordPayment(invoice._id, captured);
+        current = result.invoice;
+      }
+    }
+
+    res.json({ success: true, invoice: current });
+  } catch (error) {
+    console.error("Sync Payment Error:", error);
+    res.status(500).json({ success: false, message: "Payment sync failed" });
   }
 };

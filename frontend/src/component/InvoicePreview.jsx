@@ -140,7 +140,10 @@ export default function InvoicePreview() {
     () => readJSON("business_profile", defaultProfile) || defaultProfile
   );
   const [profileLoading, setProfileLoading] = useState(false);
-  const [paying, setPaying] = useState(false);
+  const pollRef = useRef(null);
+  const doneRef = useRef(false);
+
+  useEffect(() => () => clearInterval(pollRef.current), []);
 
   const prevTitleRef = useRef(document.title);
 
@@ -268,9 +271,8 @@ export default function InvoicePreview() {
   }, [invoice]);
 
   const handlePayment = async () => {
-    if (paying) return; // prevents double clicks creating extra orders
-    setPaying(true);
     try {
+      doneRef.current = false;
       const token = await obtainToken();
 
       const res = await fetch(`${API_BASE}/api/payment/create-order`, {
@@ -288,7 +290,6 @@ export default function InvoicePreview() {
 
       if (!data?.success || !data?.order) {
         alert(data?.message || "Payment initialization failed");
-        setPaying(false);
         return;
       }
 
@@ -298,7 +299,7 @@ export default function InvoicePreview() {
       const options = {
         key: import.meta.env.VITE_RAZORPAY_KEY_ID,
         amount: order.amount,
-        currency: order.currency || "INR",
+        currency: "INR",
         name: "Invoice Genius",
         description: `Invoice Payment - Remaining: ₹${remainingAmount}`,
         order_id: order.id,
@@ -317,34 +318,21 @@ export default function InvoicePreview() {
               },
               body: JSON.stringify({
                 invoiceId: invoice._id || invoice.id,
-                // the backend takes the amount from Razorpay, never from the browser
+                amount: remainingAmount,
+                // sent so the backend can verify the payment signature
                 razorpay_order_id: response.razorpay_order_id,
                 razorpay_payment_id: response.razorpay_payment_id,
                 razorpay_signature: response.razorpay_signature,
               }),
             });
-            const upBody = await upRes.json().catch(() => null);
-            console.log("[RZP] update-payment", upRes.status, upBody);
-            if (!upRes.ok) throw new Error(upBody?.message || "update-payment failed");
+            console.log("[RZP] update-payment status", upRes.status);
+            if (!upRes.ok) throw new Error("update-payment failed");
 
-            alert("Payment Successful!");
-            navigate("/app/invoices");
+            finishPayment();
           } catch (err) {
-            console.error("[RZP] update failed", err);
-            alert(
-              `Payment received, but updating the invoice failed: ${err.message}. ` +
-                "It will be updated automatically shortly; please refresh."
-            );
-          } finally {
-            setPaying(false);
+            console.error(err);
+            alert("Payment received, but updating the invoice failed. Please refresh.");
           }
-        },
-
-        modal: {
-          ondismiss: () => {
-            console.log("[RZP] modal dismissed");
-            setPaying(false);
-          },
         },
 
         prefill: {
@@ -353,20 +341,56 @@ export default function InvoicePreview() {
           contact: client?.phone || "",
         },
 
+        modal: {
+          ondismiss: () => {
+            console.log("[RZP] modal dismissed");
+            // keep checking for a minute in case a UPI payment is still settling
+            setTimeout(() => clearInterval(pollRef.current), 60000);
+          },
+        },
+
         theme: { color: "#16a34a" },
       };
 
-      console.log("[RZP] key:", String(options.key).slice(0, 12), "order:", order.id);
+      const finishPayment = () => {
+        if (doneRef.current) return;
+        doneRef.current = true;
+        clearInterval(pollRef.current);
+        alert("Payment Successful!");
+        navigate("/app/invoices");
+      };
+
       const razor = new window.Razorpay(options);
-      razor.on("payment.failed", (r) => {
-        console.log("[RZP] payment.failed", r.error);
-        setPaying(false);
-      });
       razor.open();
+
+      // Fallback: ask the backend to check Razorpay directly, so the invoice
+      // updates even if the browser never calls the handler (e.g. UPI QR).
+      const startPaid = Number(invoice.paidAmount) || 0;
+      const startedAt = Date.now();
+      clearInterval(pollRef.current);
+      pollRef.current = setInterval(async () => {
+        if (doneRef.current || Date.now() - startedAt > 10 * 60 * 1000) {
+          return clearInterval(pollRef.current);
+        }
+        try {
+          const tk = (await obtainToken()) || token;
+          const r = await fetch(`${API_BASE}/api/payment/sync`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${tk}` },
+            body: JSON.stringify({ invoiceId: invoice._id || invoice.id }),
+          });
+          const j = await r.json().catch(() => null);
+          if (j?.invoice && (Number(j.invoice.paidAmount) || 0) > startPaid) {
+            console.log("[RZP] sync detected payment", j.invoice.status);
+            finishPayment();
+          }
+        } catch (e) {
+          console.warn("[RZP] sync error", e);
+        }
+      }, 4000);
     } catch (err) {
       console.error(err);
       alert("Payment failed");
-      setPaying(false);
     }
   };
 
@@ -442,12 +466,8 @@ export default function InvoicePreview() {
             </button>
 
             {invoice.status !== "paid" && (
-              <button
-                onClick={handlePayment}
-                disabled={paying}
-                className="bg-green-600 text-white px-4 py-2 rounded-lg disabled:opacity-60"
-              >
-                {paying ? "Processing…" : "Pay Now"}
+              <button onClick={handlePayment} className="bg-green-600 text-white px-4 py-2 rounded-lg">
+                Pay Now
               </button>
             )}
           </div>
@@ -491,12 +511,9 @@ export default function InvoicePreview() {
                     invoice.status === "paid" ? invoicePreviewStyles.statusPaid
                     : invoice.status === "unpaid" ? invoicePreviewStyles.statusUnpaid
                     : invoice.status === "overdue" ? invoicePreviewStyles.statusOverdue
-                    : invoice.status === "partially_paid" ? invoicePreviewStyles.statusUnpaid
                     : invoicePreviewStyles.statusDraft
                   }`}>
-                    {invoice.status
-                      ? invoice.status.replace(/_/g, " ").replace(/^\w/, (c) => c.toUpperCase())
-                      : "Draft"}
+                    {invoice.status ? invoice.status.charAt(0).toUpperCase() + invoice.status.slice(1) : "Draft"}
                   </span>
                 </div>
               </div>
