@@ -1,3 +1,4 @@
+
 import mongoose from "mongoose";
 import express from "express";
 import cors from "cors";
@@ -21,18 +22,32 @@ const port = process.env.PORT || 4000;
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:4000",
+  "https://frontend-kohl-six-85.vercel.app",
+  "https://frontend-ofzhuhh5a-pushpak17.vercel.app",
   process.env.FRONTEND_URL,
-].filter(Boolean);
+]
+  .filter(Boolean)
+  .map((url) => url.replace(/\/$/, ""));
 
 const corsOptions = {
-  origin: allowedOrigins,
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin.replace(/\/$/, ""))) {
+      return callback(null, true);
+    }
+
+    console.error("Blocked CORS origin:", origin);
+    return callback(null, false);
+  },
   credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "Accept"],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "Accept",
+  ],
 };
 
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
 
 /* ---------------- MIDDLEWARE ---------------- */
 
@@ -61,11 +76,11 @@ app.get("/api/health", (req, res) => {
 
 /* ---------------- DATABASE CONNECTION ---------------- */
 
-let dbConnectionPromise;
+let dbConnectionPromise = null;
 
 const ensureDBConnection = async (req, res, next) => {
   try {
-    if (process.env.MONGO_URI === undefined) {
+    if (!process.env.MONGO_URI) {
       throw new Error("MONGO_URI environment variable is missing");
     }
 
@@ -81,11 +96,12 @@ const ensureDBConnection = async (req, res, next) => {
     }
 
     await dbConnectionPromise;
-    next();
+
+    return next();
   } catch (error) {
     console.error("Database connection failed:", error.message);
 
-    res.status(503).json({
+    return res.status(503).json({
       success: false,
       message: "Database connection unavailable",
     });
@@ -94,7 +110,12 @@ const ensureDBConnection = async (req, res, next) => {
 
 /* ---------------- API ROUTES ---------------- */
 
-app.use("/api/invoices", ensureDBConnection, requireAuth(), invoiceRouter);
+app.use(
+  "/api/invoices",
+  ensureDBConnection,
+  requireAuth(),
+  invoiceRouter
+);
 
 app.use(
   "/api/business-profile",
@@ -103,9 +124,19 @@ app.use(
   bussinessProfileRouter
 );
 
-app.use("/api/ai-invoices", ensureDBConnection, requireAuth(), aiInvoiceRouter);
+app.use(
+  "/api/ai-invoices",
+  ensureDBConnection,
+  requireAuth(),
+  aiInvoiceRouter
+);
 
-app.use("/api/payment", ensureDBConnection, requireAuth(), paymentRouter);
+app.use(
+  "/api/payment",
+  ensureDBConnection,
+  requireAuth(),
+  paymentRouter
+);
 
 /* ---------------- ERROR HANDLER ---------------- */
 
