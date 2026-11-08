@@ -1,12 +1,17 @@
+
 import multer from "multer";
 import path from "path";
 import fs from "fs";
 
-const uploadPath = "uploads";
+// Vercel allows temporary file storage only in /tmp.
+const uploadPath =
+  process.env.VERCEL === "1"
+    ? "/tmp/uploads"
+    : path.join(process.cwd(), "uploads");
 
-// ensure uploads folder exists
+// Create the upload directory if it doesn't exist.
 if (!fs.existsSync(uploadPath)) {
-  fs.mkdirSync(uploadPath);
+  fs.mkdirSync(uploadPath, { recursive: true });
 }
 
 const storage = multer.diskStorage({
@@ -19,12 +24,14 @@ const storage = multer.diskStorage({
       Date.now() + "-" + Math.round(Math.random() * 1e9);
 
     cb(null, unique + path.extname(file.originalname));
-  }
+  },
 });
 
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024 } // 5MB
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5 MB
+  },
 });
 
 export default upload;
