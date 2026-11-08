@@ -301,11 +301,14 @@ export default function InvoicePreview() {
 
         handler: async function (response) {
           try {
+            // Login tokens last ~60s and a UPI QR payment can take longer,
+            // so get a fresh one instead of reusing the token from before payment.
+            const freshToken = (await obtainToken()) || token;
             const upRes = await fetch(`${API_BASE}/api/payment/update-payment`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
-                Authorization: `Bearer ${token}`,
+                Authorization: `Bearer ${freshToken}`,
               },
               body: JSON.stringify({
                 invoiceId: invoice._id || invoice.id,

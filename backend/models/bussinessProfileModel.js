@@ -19,6 +19,8 @@ const bussinessProfileSchema = new mongoose.Schema(
 
     signatureOwnerName: { type: String, default: "" },  // ✅ FIXED
     signatureOwnerTitle: { type: String, default: "" }, // ✅ FIXED
+
+    defaultTaxPercent: { type: Number, default: 18 },
   },
   { timestamps: true }
 );

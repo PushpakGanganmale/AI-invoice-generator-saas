@@ -330,7 +330,8 @@ export default function InvoicesPage() {
             client,
             items,
             currency: "INR",
-            taxPercent: Number(aiRaw.taxPercent ?? 0),
+            // The AI endpoint returns `taxRate`, not `taxPercent`; default to 18%
+            taxPercent: Number(aiRaw.taxPercent ?? aiRaw.taxRate ?? 18),
             status: "draft",
           },
         },

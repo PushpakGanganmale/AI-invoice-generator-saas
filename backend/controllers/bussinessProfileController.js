@@ -31,6 +31,9 @@ export const createBussinessProfile = async (req, res) => {
       signatureUrl: signature,
       signatureOwnerName: req.body.signatureOwnerName || "",  // ✅ FIXED
       signatureOwnerTitle: req.body.signatureOwnerTitle || "", // ✅ FIXED
+      defaultTaxPercent: Number.isFinite(Number(req.body.defaultTaxPercent)) && req.body.defaultTaxPercent !== ""
+        ? Number(req.body.defaultTaxPercent)
+        : 18,
     });
 
     res.status(201).json({ success: true, data: profile });
@@ -60,6 +63,11 @@ export const updateBussinessProfile = async (req, res) => {
       signatureOwnerName: req.body.signatureOwnerName || "",  // ✅ FIXED
       signatureOwnerTitle: req.body.signatureOwnerTitle || "", // ✅ FIXED
     };
+
+    if (req.body.defaultTaxPercent !== undefined && req.body.defaultTaxPercent !== "" &&
+        Number.isFinite(Number(req.body.defaultTaxPercent))) {
+      updateData.defaultTaxPercent = Number(req.body.defaultTaxPercent);
+    }
 
     if (req.files?.logo?.[0]) updateData.logoUrl = req.files.logo[0].filename;
     if (req.files?.stamp?.[0]) updateData.stampUrl = req.files.stamp[0].filename;
