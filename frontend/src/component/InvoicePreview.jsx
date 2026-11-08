@@ -718,8 +718,11 @@ export default function InvoicePreview() {
       // The money may already be recorded (e.g. by the Razorpay webhook)
       // even if the verify call failed or timed out. Poll the database
       // for up to ~30s before telling the user anything went wrong.
-      const waitForRecordedPayment = async () => {
-        for (let attempt = 0; attempt < 8; attempt++) {
+      const waitForRecordedPayment = async (
+        attempts = 8,
+        delayMs = 4000
+      ) => {
+        for (let attempt = 0; attempt < attempts; attempt++) {
           try {
             const freshInvoice = await fetchInvoice(invoiceId);
 
@@ -733,11 +736,26 @@ export default function InvoicePreview() {
             console.error("Payment poll error:", pollError);
           }
 
-          await new Promise((resolve) => setTimeout(resolve, 4000));
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
         }
 
         return null;
       };
+
+      // Checkout can stay open on the UPI QR screen without ever calling
+      // `handler` (blocked polling in Brave/adblock, slow UPI callback).
+      // So while it is open we also watch the database, which the Razorpay
+      // webhook updates, and close checkout ourselves once money lands.
+      let settled = false;
+      let pollTimer = null;
+
+      const stopPolling = () => {
+        if (pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+      };
+
 
       /* -------- CHECKOUT OPTIONS -------- */
 
@@ -768,13 +786,29 @@ export default function InvoicePreview() {
         modal: {
           ondismiss: function () {
             console.log("Razorpay Checkout closed.");
+            stopPolling();
             finish();
+
+            // User may have paid and then closed the window.
+            if (!settled) {
+              waitForRecordedPayment(3, 3000).then((recorded) => {
+                if (recorded && !settled) {
+                  settled = true;
+                  setInvoice(recorded);
+                  showSuccess(recorded);
+                }
+              });
+            }
           },
         },
 
         /* -------- PAYMENT SUCCESS HANDLER -------- */
 
         handler: async function (response) {
+          if (settled) return; // poller already confirmed this payment
+          settled = true;
+          stopPolling();
+
           try {
             await verifyPaymentWithRetry({
               invoiceId,
@@ -841,6 +875,32 @@ export default function InvoicePreview() {
       });
 
       razor.open();
+
+      pollTimer = setInterval(async () => {
+        if (settled) return stopPolling();
+
+        try {
+          const freshInvoice = await fetchInvoice(invoiceId);
+
+          if (
+            !settled &&
+            round2(Number(freshInvoice.paidAmount || 0)) > paidBefore
+          ) {
+            settled = true;
+            stopPolling();
+
+            try {
+              razor.close();
+            } catch {}
+
+            setInvoice(freshInvoice);
+            showSuccess(freshInvoice);
+            finish();
+          }
+        } catch (pollError) {
+          console.error("Payment poll error:", pollError);
+        }
+      }, 5000);
     } catch (error) {
       console.error("Payment Error:", error);
 
