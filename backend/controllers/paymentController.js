@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import Razorpay from "razorpay";
+import { getAuth } from "@clerk/express";
 import Invoice from "../models/invoiceModel.js";
 
 const razorpay = new Razorpay({
@@ -11,8 +12,41 @@ const round2 = (n) => Number(Number(n).toFixed(2));
 
 // If the route is behind Clerk auth, only the invoice owner may pay / update it.
 function canAccess(req, invoice) {
-  const userId = req.auth?.userId;
-  return !userId || invoice.owner === userId;
+  const { userId } = getAuth(req);
+  return Boolean(userId) && invoice.owner === userId;
+}
+
+/**
+ * Idempotent: called by BOTH the browser (update-payment) and the webhook.
+ * The $ne filter makes the push atomic, so only one caller can record a
+ * given payment id. Razorpay amounts are paise; paidAmount is rupees.
+ */
+export async function recordPayment(invoiceId, payment) {
+  const amount = round2(Number(payment.amount) / 100);
+
+  const updated = await Invoice.findOneAndUpdate(
+    { _id: invoiceId, "payments.paymentId": { $ne: payment.id } },
+    {
+      $push: {
+        payments: {
+          paymentId: payment.id,
+          orderId: payment.order_id,
+          amount,
+          method: payment.method,
+          at: new Date(),
+        },
+      },
+    },
+    { new: true }
+  );
+
+  if (!updated) return { recorded: false }; // already recorded, or invoice missing
+
+  // pre("save") hook recalculates remainingAmount and status
+  updated.paidAmount = round2((Number(updated.paidAmount) || 0) + amount);
+  updated.razorpayPaymentId = payment.id;
+  await updated.save();
+  return { recorded: true, invoice: updated };
 }
 
 /* ---------------- CREATE ORDER ---------------- */
@@ -81,6 +115,7 @@ export const createOrder = async (req, res) => {
       amount: Math.round(Number(amount) * 100),
       currency: "INR",
       receipt: `invoice_${invoice._id}`,
+      notes: { invoiceId: String(invoice._id) }, // lets the webhook find the invoice
     });
 
     /* -------- SYNC INVOICE + REMEMBER THE ORDER -------- */
@@ -141,28 +176,6 @@ export const updatePayment = async (req, res) => {
       });
     }
 
-    /* -------- ALREADY RECORDED (e.g. the request was sent twice) -------- */
-
-    if (invoice.razorpayPaymentId === razorpay_payment_id) {
-      return res.json({ success: true, invoice });
-    }
-
-    if (invoice.status === "paid") {
-      return res.status(400).json({
-        success: false,
-        message: "Invoice is already fully paid",
-      });
-    }
-
-    /* -------- THE ORDER MUST BELONG TO THIS INVOICE -------- */
-
-    if (invoice.razorpayOrderId !== razorpay_order_id) {
-      return res.status(400).json({
-        success: false,
-        message: "Order does not match this invoice",
-      });
-    }
-
     /* -------- VERIFY RAZORPAY SIGNATURE -------- */
 
     const expected = crypto
@@ -174,26 +187,45 @@ export const updatePayment = async (req, res) => {
     const b = Buffer.from(String(razorpay_signature));
 
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      console.error(
+        "Signature mismatch: check RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET are the same mode (test vs live)"
+      );
       return res.status(400).json({
         success: false,
         message: "Payment verification failed",
       });
     }
 
-    /* -------- AMOUNT COMES FROM RAZORPAY, NOT FROM THE BROWSER -------- */
+    /* -------- FETCH THE PAYMENT FROM RAZORPAY (never trust the browser) -------- */
 
-    const rzOrder = await razorpay.orders.fetch(razorpay_order_id);
-    const paidNow = round2(Number(rzOrder.amount) / 100);
+    const payment = await razorpay.payments.fetch(razorpay_payment_id);
 
-    // pre("save") hook auto-calculates remainingAmount and status
-    invoice.paidAmount = round2((Number(invoice.paidAmount) || 0) + paidNow);
-    invoice.razorpayPaymentId = razorpay_payment_id;
-    invoice.razorpaySignature = razorpay_signature;
-    await invoice.save();
+    if (
+      payment.order_id !== razorpay_order_id ||
+      payment.notes?.invoiceId !== String(invoice._id)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment does not match this invoice",
+      });
+    }
 
-    res.json({
+    if (payment.status !== "captured") {
+      return res.status(409).json({
+        success: false,
+        message: `Payment is ${payment.status}, not captured yet`,
+      });
+    }
+
+    /* -------- RECORD (idempotent, safe if the webhook already did it) -------- */
+
+    const result = await recordPayment(invoice._id, payment);
+    const fresh = result.invoice || (await Invoice.findById(invoice._id));
+
+    return res.json({
       success: true,
-      invoice,
+      alreadyProcessed: !result.recorded,
+      invoice: fresh,
     });
   } catch (error) {
     console.error("Payment Update Error:", error);

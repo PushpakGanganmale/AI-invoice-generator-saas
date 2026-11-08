@@ -140,6 +140,7 @@ export default function InvoicePreview() {
     () => readJSON("business_profile", defaultProfile) || defaultProfile
   );
   const [profileLoading, setProfileLoading] = useState(false);
+  const [paying, setPaying] = useState(false);
 
   const prevTitleRef = useRef(document.title);
 
@@ -267,6 +268,8 @@ export default function InvoicePreview() {
   }, [invoice]);
 
   const handlePayment = async () => {
+    if (paying) return; // prevents double clicks creating extra orders
+    setPaying(true);
     try {
       const token = await obtainToken();
 
@@ -285,6 +288,7 @@ export default function InvoicePreview() {
 
       if (!data?.success || !data?.order) {
         alert(data?.message || "Payment initialization failed");
+        setPaying(false);
         return;
       }
 
@@ -294,12 +298,13 @@ export default function InvoicePreview() {
       const options = {
         key: import.meta.env.VITE_RAZORPAY_KEY_ID,
         amount: order.amount,
-        currency: "INR",
+        currency: order.currency || "INR",
         name: "Invoice Genius",
         description: `Invoice Payment - Remaining: ₹${remainingAmount}`,
         order_id: order.id,
 
         handler: async function (response) {
+          console.log("[RZP] handler fired", response);
           try {
             // Login tokens last ~60s and a UPI QR payment can take longer,
             // so get a fresh one instead of reusing the token from before payment.
@@ -312,21 +317,34 @@ export default function InvoicePreview() {
               },
               body: JSON.stringify({
                 invoiceId: invoice._id || invoice.id,
-                amount: remainingAmount,
-                // sent so the backend can verify the payment signature
+                // the backend takes the amount from Razorpay, never from the browser
                 razorpay_order_id: response.razorpay_order_id,
                 razorpay_payment_id: response.razorpay_payment_id,
                 razorpay_signature: response.razorpay_signature,
               }),
             });
-            if (!upRes.ok) throw new Error("update-payment failed");
+            const upBody = await upRes.json().catch(() => null);
+            console.log("[RZP] update-payment", upRes.status, upBody);
+            if (!upRes.ok) throw new Error(upBody?.message || "update-payment failed");
 
             alert("Payment Successful!");
             navigate("/app/invoices");
           } catch (err) {
-            console.error(err);
-            alert("Payment received, but updating the invoice failed. Please refresh.");
+            console.error("[RZP] update failed", err);
+            alert(
+              `Payment received, but updating the invoice failed: ${err.message}. ` +
+                "It will be updated automatically shortly; please refresh."
+            );
+          } finally {
+            setPaying(false);
           }
+        },
+
+        modal: {
+          ondismiss: () => {
+            console.log("[RZP] modal dismissed");
+            setPaying(false);
+          },
         },
 
         prefill: {
@@ -338,11 +356,17 @@ export default function InvoicePreview() {
         theme: { color: "#16a34a" },
       };
 
+      console.log("[RZP] key:", String(options.key).slice(0, 12), "order:", order.id);
       const razor = new window.Razorpay(options);
+      razor.on("payment.failed", (r) => {
+        console.log("[RZP] payment.failed", r.error);
+        setPaying(false);
+      });
       razor.open();
     } catch (err) {
       console.error(err);
       alert("Payment failed");
+      setPaying(false);
     }
   };
 
@@ -418,8 +442,12 @@ export default function InvoicePreview() {
             </button>
 
             {invoice.status !== "paid" && (
-              <button onClick={handlePayment} className="bg-green-600 text-white px-4 py-2 rounded-lg">
-                Pay Now
+              <button
+                onClick={handlePayment}
+                disabled={paying}
+                className="bg-green-600 text-white px-4 py-2 rounded-lg disabled:opacity-60"
+              >
+                {paying ? "Processing…" : "Pay Now"}
               </button>
             )}
           </div>
@@ -463,9 +491,12 @@ export default function InvoicePreview() {
                     invoice.status === "paid" ? invoicePreviewStyles.statusPaid
                     : invoice.status === "unpaid" ? invoicePreviewStyles.statusUnpaid
                     : invoice.status === "overdue" ? invoicePreviewStyles.statusOverdue
+                    : invoice.status === "partially_paid" ? invoicePreviewStyles.statusUnpaid
                     : invoicePreviewStyles.statusDraft
                   }`}>
-                    {invoice.status ? invoice.status.charAt(0).toUpperCase() + invoice.status.slice(1) : "Draft"}
+                    {invoice.status
+                      ? invoice.status.replace(/_/g, " ").replace(/^\w/, (c) => c.toUpperCase())
+                      : "Draft"}
                   </span>
                 </div>
               </div>
