@@ -100,6 +100,77 @@ function gatewayMessage(error, fallback) {
   return description ? `${fallback} (${description})` : fallback;
 }
 
+/* ---------------- ATOMIC RECORD (shared) ---------------- */
+
+// Records one captured payment exactly once. Safe to call from verify,
+// sync and webhook at the same time: razorpayPaymentIds acts as the lock.
+function applyPayment({
+  invoice,
+  userId,
+  paymentId,
+  orderId,
+  signature,
+  paymentAmount,
+}) {
+  return Invoice.collection.updateOne(
+    {
+      _id: invoice._id,
+      owner: userId,
+      razorpayPaymentIds: { $ne: paymentId },
+      $expr: {
+        $lte: [
+          { $add: [{ $ifNull: ["$paidAmount", 0] }, paymentAmount] },
+          { $add: [{ $ifNull: ["$total", 0] }, 0.005] },
+        ],
+      },
+    },
+    [
+      {
+        $set: {
+          paidAmount: {
+            $round: [
+              { $add: [{ $ifNull: ["$paidAmount", 0] }, paymentAmount] },
+              2,
+            ],
+          },
+          razorpayPaymentIds: {
+            $concatArrays: [
+              { $ifNull: ["$razorpayPaymentIds", []] },
+              [paymentId],
+            ],
+          },
+          razorpayPaymentId: paymentId,
+          razorpayOrderId: orderId,
+          ...(signature ? { razorpaySignature: signature } : {}),
+          updatedAt: "$$NOW",
+        },
+      },
+      {
+        $set: {
+          remainingAmount: {
+            $round: [
+              {
+                $max: [
+                  0,
+                  { $subtract: [{ $ifNull: ["$total", 0] }, "$paidAmount"] },
+                ],
+              },
+              2,
+            ],
+          },
+        },
+      },
+      {
+        $set: {
+          status: {
+            $cond: [{ $lte: ["$remainingAmount", 0] }, "paid", "partially_paid"],
+          },
+        },
+      },
+    ]
+  );
+}
+
 /* ---------------- CREATE ORDER ---------------- */
 
 export const createOrder = async (req, res) => {
@@ -523,6 +594,127 @@ export const updatePayment = async (req, res) => {
     return res.status(error?.statusCode ? 502 : 500).json({
       success: false,
       message: gatewayMessage(error, "Payment verification failed."),
+    });
+  }
+};
+
+
+/* ---------------- SYNC PAYMENTS ---------------- */
+
+// Does not depend on the browser callback or the webhook. Asks Razorpay
+// directly what happened on this invoice's latest order, captures it if it
+// is only "authorized", and records anything captured. Idempotent.
+export const syncPayments = async (req, res) => {
+  try {
+    const userId = getUserId(req);
+    const { invoiceId } = req.body || {};
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: "User not authenticated.",
+      });
+    }
+
+    if (!invoiceId || !mongoose.Types.ObjectId.isValid(invoiceId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid invoice ID.",
+      });
+    }
+
+    const invoice = await Invoice.findOne({
+      _id: invoiceId,
+      owner: userId,
+    });
+
+    if (!invoice) {
+      return res.status(404).json({
+        success: false,
+        message: "Invoice not found.",
+      });
+    }
+
+    const orderId = invoice.razorpayOrderId;
+
+    if (!orderId) {
+      return res.status(200).json({
+        success: true,
+        recorded: 0,
+        invoice,
+      });
+    }
+
+    const rzp = getRazorpay();
+
+    const order = await rzp.orders.fetch(orderId);
+    const notes = order?.notes || {};
+
+    if (
+      notes.invoiceId !== String(invoice._id) ||
+      notes.owner !== userId ||
+      order.currency !== "INR"
+    ) {
+      return res.status(200).json({
+        success: true,
+        recorded: 0,
+        invoice,
+      });
+    }
+
+    const list = await rzp.orders.fetchPayments(orderId);
+
+    let recorded = 0;
+
+    for (const item of list?.items || []) {
+      if ((invoice.razorpayPaymentIds || []).includes(item.id)) continue;
+
+      if (item.status !== "authorized" && item.status !== "captured") {
+        continue;
+      }
+
+      const payment = await settlePayment(rzp, item.id, order);
+
+      if (
+        payment.status !== "captured" ||
+        payment.currency !== "INR" ||
+        Number(payment.amount) !== Number(order.amount)
+      ) {
+        continue;
+      }
+
+      const paymentAmount = Number((Number(payment.amount) / 100).toFixed(2));
+
+      if (!Number.isFinite(paymentAmount) || paymentAmount <= 0) continue;
+
+      const result = await applyPayment({
+        invoice,
+        userId,
+        paymentId: String(payment.id),
+        orderId: String(orderId),
+        signature: null,
+        paymentAmount,
+      });
+
+      if (result.matchedCount > 0) recorded += 1;
+    }
+
+    const fresh = await Invoice.findOne({
+      _id: invoice._id,
+      owner: userId,
+    });
+
+    return res.status(200).json({
+      success: true,
+      recorded,
+      invoice: fresh,
+    });
+  } catch (error) {
+    console.error("Sync Payments Error:", error);
+
+    return res.status(error?.statusCode ? 502 : 500).json({
+      success: false,
+      message: gatewayMessage(error, "Payment sync failed."),
     });
   }
 };

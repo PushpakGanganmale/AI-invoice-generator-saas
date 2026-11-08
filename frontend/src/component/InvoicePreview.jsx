@@ -715,6 +715,27 @@ export default function InvoicePreview() {
         );
       };
 
+      // Asks the backend to check Razorpay directly for this invoice's
+      // latest order and record any captured payment. Never throws.
+      const syncWithRazorpay = async () => {
+        try {
+          const syncToken = await obtainToken();
+
+          if (!syncToken) return;
+
+          await fetch(`${API_BASE}/api/payment/sync`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${syncToken}`,
+            },
+            body: JSON.stringify({ invoiceId }),
+          });
+        } catch (syncError) {
+          console.error("Payment sync error:", syncError);
+        }
+      };
+
       // The money may already be recorded (e.g. by the Razorpay webhook)
       // even if the verify call failed or timed out. Poll the database
       // for up to ~30s before telling the user anything went wrong.
@@ -724,6 +745,8 @@ export default function InvoicePreview() {
       ) => {
         for (let attempt = 0; attempt < attempts; attempt++) {
           try {
+            await syncWithRazorpay();
+
             const freshInvoice = await fetchInvoice(invoiceId);
 
             if (
@@ -872,6 +895,14 @@ export default function InvoicePreview() {
           "Razorpay payment attempt failed:",
           response?.error
         );
+
+        const reason =
+          response?.error?.description ||
+          "The payment could not be completed.";
+
+        alert(
+          `Payment failed: ${reason}\n\nNo money has been recorded on this invoice. You can retry in the checkout window.`
+        );
       });
 
       razor.open();
@@ -880,6 +911,8 @@ export default function InvoicePreview() {
         if (settled) return stopPolling();
 
         try {
+          await syncWithRazorpay();
+
           const freshInvoice = await fetchInvoice(invoiceId);
 
           if (
