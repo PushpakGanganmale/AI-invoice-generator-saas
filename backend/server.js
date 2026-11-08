@@ -1,10 +1,9 @@
-
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
 import path from "path";
 
-import { clerkMiddleware, requireAuth } from "@clerk/express";
+import { clerkMiddleware, getAuth } from "@clerk/express";
 import { connectDB } from "./config/db.js";
 
 import invoiceRouter from "./routes/invoiceRouter.js";
@@ -17,10 +16,19 @@ const port = process.env.PORT || 4000;
 
 /* ---------------- CORS ---------------- */
 
+// FRONTEND_URL may hold one or more comma-separated origins.
+const envOrigins = (process.env.FRONTEND_URL || "")
+  .split(",")
+  .map((s) => s.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
+
 const allowedOrigins = [
-  "http://localhost:5173",
-  "https://invoicegenius-4ffi.onrender.com",
-  "https://frontend-kohl-six-85.vercel.app",
+  ...new Set([
+    "http://localhost:5173",
+    "https://invoicegenius-4ffi.onrender.com",
+    "https://frontend-kohl-six-85.vercel.app",
+    ...envOrigins,
+  ]),
 ];
 
 app.use(
@@ -35,11 +43,7 @@ app.use(
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "Accept",
-    ],
+    allowedHeaders: ["Content-Type", "Authorization", "Accept"],
   })
 );
 
@@ -51,6 +55,27 @@ app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 /* ---------------- CLERK ---------------- */
 
 app.use(clerkMiddleware());
+
+// Returns JSON 401 for API clients. Clerk's requireAuth() redirects to a
+// sign-in page instead, which browsers report as a CORS/network error.
+const requireApiAuth = (req, res, next) => {
+  let userId = null;
+
+  try {
+    userId = getAuth(req)?.userId ?? null;
+  } catch (error) {
+    console.error("Clerk auth error:", error);
+  }
+
+  if (!userId) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized. Please sign in again.",
+    });
+  }
+
+  next();
+};
 
 /* ---------------- STATIC FILES ---------------- */
 
@@ -96,29 +121,17 @@ app.get("/api/health", (req, res) => {
 
 /* ---------------- API ROUTES ---------------- */
 
-app.use(
-  "/api/invoices",
-  requireAuth(),
-  invoiceRouter
-);
+app.use("/api/invoices", requireApiAuth, invoiceRouter);
 
 app.use(
   "/api/business-profile",
-  requireAuth(),
+  requireApiAuth,
   bussinessProfileRouter
 );
 
-app.use(
-  "/api/ai-invoices",
-  requireAuth(),
-  aiInvoiceRouter
-);
+app.use("/api/ai-invoices", requireApiAuth, aiInvoiceRouter);
 
-app.use(
-  "/api/payment",
-  requireAuth(),
-  paymentRouter
-);
+app.use("/api/payment", requireApiAuth, paymentRouter);
 
 /* ---------------- 404 ---------------- */
 
@@ -152,9 +165,7 @@ if (process.env.VERCEL !== "1") {
       await connectDB();
 
       app.listen(port, () => {
-        console.log(
-          `InvoiceGenius running on port ${port}`
-        );
+        console.log(`InvoiceGenius running on port ${port}`);
       });
     } catch (error) {
       console.error("Server startup failed:", error);

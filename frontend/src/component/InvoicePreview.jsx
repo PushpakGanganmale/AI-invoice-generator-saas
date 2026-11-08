@@ -1,4 +1,3 @@
-
 import React, {
   useState,
   useEffect,
@@ -15,13 +14,17 @@ import {
 import { useAuth } from "@clerk/clerk-react";
 import { invoicePreviewStyles } from "../assets/dummyStyles";
 
-const API_BASE = import.meta.env.VITE_API_BASE;
+// Strip trailing slashes so "https://api.com/" does not produce "//api/..."
+const API_BASE = (import.meta.env.VITE_API_BASE || "").replace(
+  /\/+$/,
+  ""
+);
 
-const RAZORPAY_KEY_ID =
-  import.meta.env.VITE_RAZORPAY_KEY_ID;
+// Fallback only. The backend returns its own key with every order,
+// so frontend and backend keys can never mismatch.
+const RAZORPAY_KEY_ID = import.meta.env.VITE_RAZORPAY_KEY_ID;
 
-const PROFILE_ENDPOINT =
-  `${API_BASE}/api/business-profile/me`;
+const PROFILE_ENDPOINT = `${API_BASE}/api/business-profile/me`;
 
 const INVOICE_ENDPOINT = (id) =>
   `${API_BASE}/api/invoices/${encodeURIComponent(id)}`;
@@ -41,16 +44,16 @@ function resolveImageUrl(url) {
         (parsed.search || "") +
         (parsed.hash || "");
 
-      return `${API_BASE.replace(/\/+$/, "")}${path}`;
+      return `${API_BASE}${path}`;
     } catch {
       const path = s.replace(/^https?:\/\/[^/]+/, "");
-      return `${API_BASE.replace(/\/+$/, "")}${path}`;
+      return `${API_BASE}${path}`;
     }
   }
 
   if (/^https?:\/\//i.test(s)) return s;
 
-  return `${API_BASE.replace(/\/+$/, "")}/${s.replace(/^\/+/, "")}`;
+  return `${API_BASE}/${s.replace(/^\/+/, "")}`;
 }
 
 function readJSON(key, fallback = null) {
@@ -67,10 +70,6 @@ function writeJSON(key, value) {
   try {
     localStorage.setItem(key, JSON.stringify(value));
   } catch {}
-}
-
-function getStoredInvoices() {
-  return readJSON("invoices_v1", []) || [];
 }
 
 const defaultProfile = {
@@ -157,6 +156,8 @@ function normalizeClient(raw) {
   };
 }
 
+const round2 = (n) => Number(Number(n || 0).toFixed(2));
+
 /* ---------------- ICONS ---------------- */
 
 const PrintIcon = ({ className = "w-4 h-4" }) => (
@@ -215,6 +216,12 @@ export default function InvoicePreview() {
 
   const [paymentLoading, setPaymentLoading] =
     useState(false);
+
+  // Amount (in invoice currency) the user wants to pay now.
+  const [payAmount, setPayAmount] = useState("");
+
+  // Guards against double clicks / double checkout.
+  const payingRef = useRef(false);
 
   const [profile, setProfile] = useState(
     () => readJSON("business_profile", defaultProfile) ||
@@ -286,6 +293,78 @@ export default function InvoicePreview() {
     [obtainToken]
   );
 
+  /* ---------------- VERIFY PAYMENT (with retry) ---------------- */
+
+  // Verification is idempotent on the backend, so retrying is safe.
+  // A fresh Clerk token is requested on every attempt because tokens
+  // expire after ~60 seconds, which is shorter than many checkouts.
+  const verifyPaymentWithRetry = useCallback(
+    async (payload) => {
+      let lastError = null;
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const token = await obtainToken();
+
+          if (!token) {
+            throw new Error("Please sign in again.");
+          }
+
+          const response = await fetch(
+            `${API_BASE}/api/payment/update-payment`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify(payload),
+            }
+          );
+
+          let data = null;
+
+          try {
+            data = await response.json();
+          } catch {}
+
+          if (response.ok && data?.success) {
+            return data;
+          }
+
+          const err = new Error(
+            data?.message ||
+              `Payment verification failed (HTTP ${response.status}).`
+          );
+
+          // Definitive client errors should not be retried.
+          if (
+            response.status >= 400 &&
+            response.status < 500 &&
+            ![401, 408, 409, 429].includes(response.status)
+          ) {
+            err.final = true;
+            throw err;
+          }
+
+          lastError = err;
+        } catch (error) {
+          if (error.final) throw error;
+          lastError = error;
+        }
+
+        await new Promise((resolve) =>
+          setTimeout(resolve, attempt * 1500)
+        );
+      }
+
+      throw (
+        lastError || new Error("Payment verification failed.")
+      );
+    },
+    [obtainToken]
+  );
+
   useEffect(() => {
     let mounted = true;
 
@@ -325,6 +404,22 @@ export default function InvoicePreview() {
       mounted = false;
     };
   }, [id, fetchInvoice]);
+
+  /* ---------------- DEFAULT PAY AMOUNT = REMAINING BALANCE ---------------- */
+
+  useEffect(() => {
+    if (!invoice) return;
+
+    const remaining = Math.max(
+      round2(
+        Number(invoice.total || 0) -
+          Number(invoice.paidAmount || 0)
+      ),
+      0
+    );
+
+    setPayAmount(remaining > 0 ? String(remaining) : "");
+  }, [invoice]);
 
   /* ---------------- FETCH PROFILE ---------------- */
 
@@ -476,16 +571,16 @@ export default function InvoicePreview() {
   /* ---------------- PAYMENT ---------------- */
 
   const handlePayment = async () => {
-    if (paymentLoading) return;
+    if (payingRef.current || paymentLoading) return;
 
     if (!isSignedIn) {
       alert("Please sign in before making a payment.");
       return;
     }
 
-    if (!API_BASE || !RAZORPAY_KEY_ID) {
+    if (!API_BASE) {
       alert(
-        "Payment configuration is missing. Please contact support."
+        "Payment configuration is missing (VITE_API_BASE). Please contact support."
       );
       return;
     }
@@ -509,9 +604,40 @@ export default function InvoicePreview() {
       return;
     }
 
+    const remaining = Math.max(
+      round2(
+        Number(invoice.total || 0) -
+          Number(invoice.paidAmount || 0)
+      ),
+      0
+    );
+
+    const amountToPay = round2(Number(payAmount));
+
+    if (!Number.isFinite(amountToPay) || amountToPay < 1) {
+      alert("Please enter an amount of at least 1.00.");
+      return;
+    }
+
+    if (amountToPay > remaining + 0.001) {
+      alert(
+        `The amount cannot exceed the remaining balance (${currencyFmt(
+          remaining,
+          invoice.currency
+        )}).`
+      );
+      return;
+    }
+
+    payingRef.current = true;
     setPaymentLoading(true);
 
-    let razor = null;
+    const finish = () => {
+      payingRef.current = false;
+      setPaymentLoading(false);
+    };
+
+    const clientInfo = normalizeClient(invoice.client);
 
     try {
       const token = await obtainToken();
@@ -532,11 +658,16 @@ export default function InvoicePreview() {
           },
           body: JSON.stringify({
             invoiceId,
+            amount: amountToPay,
           }),
         }
       );
 
-      const orderData = await orderResponse.json();
+      let orderData = null;
+
+      try {
+        orderData = await orderResponse.json();
+      } catch {}
 
       if (
         !orderResponse.ok ||
@@ -545,16 +676,25 @@ export default function InvoicePreview() {
       ) {
         throw new Error(
           orderData?.message ||
-            "Payment initialization failed."
+            `Payment initialization failed (HTTP ${orderResponse.status}).`
         );
       }
 
       const order = orderData.order;
 
+      // The backend's key always matches its secret (test vs live).
+      const checkoutKey = orderData.keyId || RAZORPAY_KEY_ID;
+
+      if (!checkoutKey) {
+        throw new Error(
+          "Razorpay public key is not available. Please contact support."
+        );
+      }
+
       /* -------- CHECKOUT OPTIONS -------- */
 
       const options = {
-        key: RAZORPAY_KEY_ID,
+        key: checkoutKey,
 
         amount: order.amount,
 
@@ -568,9 +708,9 @@ export default function InvoicePreview() {
         order_id: order.id,
 
         prefill: {
-          name: client.name || "",
-          email: client.email || "",
-          contact: client.phone || "",
+          name: clientInfo.name || "",
+          email: clientInfo.email || "",
+          contact: clientInfo.phone || "",
         },
 
         theme: {
@@ -580,7 +720,7 @@ export default function InvoicePreview() {
         modal: {
           ondismiss: function () {
             console.log("Razorpay Checkout closed.");
-            setPaymentLoading(false);
+            finish();
           },
         },
 
@@ -588,61 +728,34 @@ export default function InvoicePreview() {
 
         handler: async function (response) {
           try {
-            const verifyResponse = await fetch(
-              `${API_BASE}/api/payment/update-payment`,
-              {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  Authorization: `Bearer ${token}`,
-                },
-                body: JSON.stringify({
-                  invoiceId,
-
-                  razorpay_payment_id:
-                    response.razorpay_payment_id,
-
-                  razorpay_order_id:
-                    response.razorpay_order_id,
-
-                  razorpay_signature:
-                    response.razorpay_signature,
-                }),
-              }
-            );
-
-            const verifyData =
-              await verifyResponse.json();
-
-            if (
-              !verifyResponse.ok ||
-              !verifyData?.success
-            ) {
-              throw new Error(
-                verifyData?.message ||
-                  "Payment verification failed."
-              );
-            }
-
-            /* -------- CLOSE CHECKOUT -------- */
-
-            if (razor) {
-              razor.close();
-            }
+            await verifyPaymentWithRetry({
+              invoiceId,
+              razorpay_payment_id:
+                response.razorpay_payment_id,
+              razorpay_order_id: response.razorpay_order_id,
+              razorpay_signature: response.razorpay_signature,
+            });
 
             /* -------- REFRESH FROM DATABASE -------- */
 
-            const freshInvoice =
-              await fetchInvoice(invoiceId);
+            const freshInvoice = await fetchInvoice(invoiceId);
 
             setInvoice(freshInvoice);
+
+            const freshRemaining = Math.max(
+              round2(
+                Number(freshInvoice.total || 0) -
+                  Number(freshInvoice.paidAmount || 0)
+              ),
+              0
+            );
 
             alert(
               `Payment successful!\n\nPaid: ${currencyFmt(
                 freshInvoice.paidAmount,
                 freshInvoice.currency
               )}\nRemaining: ${currencyFmt(
-                freshInvoice.remainingAmount,
+                freshRemaining,
                 freshInvoice.currency
               )}\nStatus: ${freshInvoice.status}`
             );
@@ -653,15 +766,14 @@ export default function InvoicePreview() {
             );
 
             alert(
-              `Payment verification/update issue: ${error.message}\n\nDo not pay again immediately. Check your Razorpay Dashboard and invoice payment status first.`
+              `Payment verification/update issue: ${error.message}\n\nReference: ${
+                response?.razorpay_payment_id || "N/A"
+              }\n\nDo not pay again immediately. Check your Razorpay Dashboard and invoice payment status first.`
             );
 
-            // Try to refresh the invoice even if the response
-            // from the verification request was unsuccessful.
+            // Refresh anyway: the payment may have been recorded.
             try {
-              const freshInvoice =
-                await fetchInvoice(invoiceId);
-
+              const freshInvoice = await fetchInvoice(invoiceId);
               setInvoice(freshInvoice);
             } catch (refreshError) {
               console.error(
@@ -670,27 +782,22 @@ export default function InvoicePreview() {
               );
             }
           } finally {
-            setPaymentLoading(false);
+            finish();
           }
         },
       };
 
       /* -------- OPEN CHECKOUT -------- */
 
-      razor = new window.Razorpay(options);
+      const razor = new window.Razorpay(options);
 
+      // Razorpay keeps its modal open and lets the user retry after a
+      // failed attempt, so we only log here. ondismiss resets the button.
       razor.on("payment.failed", function (response) {
         console.error(
-          "Razorpay payment failed:",
-          response.error
+          "Razorpay payment attempt failed:",
+          response?.error
         );
-
-        alert(
-          response.error?.description ||
-            "Payment failed. Please try again."
-        );
-
-        setPaymentLoading(false);
       });
 
       razor.open();
@@ -699,7 +806,7 @@ export default function InvoicePreview() {
 
       alert(error.message || "Payment initialization failed.");
 
-      setPaymentLoading(false);
+      finish();
     }
   };
 
@@ -770,8 +877,9 @@ export default function InvoicePreview() {
 
   const paidAmount = Number(invoice.paidAmount || 0);
 
-  const remainingAmount = Number(
-    invoice.remainingAmount ?? Math.max(total - paidAmount, 0)
+  const remainingAmount = Math.max(
+    round2(total - paidAmount),
+    0
   );
 
   const logo = resolveImageUrl(
@@ -860,19 +968,43 @@ export default function InvoicePreview() {
               Print / Save as PDF
             </button>
 
-            {invoice.status !== "paid" && (
-              <button
-                onClick={handlePayment}
-                disabled={paymentLoading}
-                className="bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg"
-              >
-                {paymentLoading
-                  ? "Processing..."
-                  : `Pay ${currencyFmt(
-                      remainingAmount,
-                      invoiceCurrency
-                    )}`}
-              </button>
+            {invoice.status !== "paid" && remainingAmount > 0 && (
+              <>
+                <div className="flex items-center gap-2">
+                  <label
+                    htmlFor="pay-amount"
+                    className="text-sm text-gray-600 whitespace-nowrap"
+                  >
+                    Pay amount
+                  </label>
+
+                  <input
+                    id="pay-amount"
+                    type="number"
+                    inputMode="decimal"
+                    min="1"
+                    max={remainingAmount}
+                    step="0.01"
+                    value={payAmount}
+                    onChange={(e) => setPayAmount(e.target.value)}
+                    disabled={paymentLoading}
+                    className="w-28 border border-gray-300 rounded-lg px-3 py-2 text-sm disabled:opacity-50"
+                  />
+                </div>
+
+                <button
+                  onClick={handlePayment}
+                  disabled={paymentLoading}
+                  className="bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-2 rounded-lg"
+                >
+                  {paymentLoading
+                    ? "Processing..."
+                    : `Pay ${currencyFmt(
+                        Number(payAmount) || 0,
+                        invoiceCurrency
+                      )}`}
+                </button>
+              </>
             )}
           </div>
         </div>
@@ -981,6 +1113,8 @@ export default function InvoicePreview() {
                     } ${
                       invoice.status === "paid"
                         ? invoicePreviewStyles.statusPaid
+                        : invoice.status === "partially_paid"
+                        ? "text-amber-600 font-semibold"
                         : invoice.status === "unpaid"
                         ? invoicePreviewStyles.statusUnpaid
                         : invoice.status === "overdue"
